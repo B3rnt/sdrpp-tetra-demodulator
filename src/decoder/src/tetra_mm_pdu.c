@@ -42,7 +42,7 @@ static const struct value_string mm_pdut_d_names[] = {
 };
 const char *tetra_mm_pdu_get_name(uint8_t pdu_type)
 {
-    const char *name = get_value_string(mm_pdu_d_names, pdu_type);
+    const char *name = get_value_string(mm_pdut_d_names, pdu_type);
 
     if (name) {
         char buf[64];
