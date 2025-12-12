@@ -21,7 +21,7 @@
 // #include <unistd.h>
 // #include <osmocom/core/utils.h>
 #include "tetra_common.h"
-
+#include "mm_log.h"
 #include "tetra_mm_pdu.h"
 
 static const struct value_string mm_pdut_d_names[] = {
@@ -40,8 +40,16 @@ static const struct value_string mm_pdut_d_names[] = {
 	{ TMM_PDU_T_D_MM_PDU_NOTSUPP,	"MM PDU/FUNCTION NOT SUPPORTED" },
 	{ 0, NULL }
 };
-const char *tetra_get_mm_pdut_name(uint8_t pdut, int uplink)
+const char *tetra_mm_pdu_get_name(uint8_t pdu_type)
 {
-	/* FIXME: uplink */
-	return get_value_string(mm_pdut_d_names, pdut);
+    const char *name = get_value_string(mm_pdu_d_names, pdu_type);
+
+    if (name) {
+        MmLog::inst().log(std::string("MM PDU: ") + name);
+    } else {
+        MmLog::inst().log("MM PDU: UNKNOWN");
+    }
+
+    return name;
 }
+
