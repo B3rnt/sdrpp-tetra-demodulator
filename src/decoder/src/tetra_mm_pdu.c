@@ -45,11 +45,12 @@ const char *tetra_mm_pdu_get_name(uint8_t pdu_type)
     const char *name = get_value_string(mm_pdu_d_names, pdu_type);
 
     if (name) {
-        MmLog::inst().log(std::string("MM PDU: ") + name);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "MM PDU: %s", name);
+        mm_log(buf);
     } else {
-        MmLog::inst().log("MM PDU: UNKNOWN");
+        mm_log("MM PDU: UNKNOWN");
     }
 
     return name;
 }
-
