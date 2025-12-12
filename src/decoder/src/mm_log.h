@@ -1,28 +1,11 @@
 #pragma once
-#include <mutex>
-#include <fstream>
-#include <string>
+#include <stdio.h>
 
-class MmLog {
-public:
-    static MmLog& inst() {
-        static MmLog s;
-        return s;
-    }
-
-    void log(const std::string& line) {
-        std::lock_guard<std::mutex> lk(m_);
-        if (!ofs_.is_open()) {
-            ofs_.open("tetra_mm.log", std::ios::out | std::ios::app);
-        }
-        if (ofs_.is_open()) {
-            ofs_ << line << "\n";
-            ofs_.flush();
-        }
-    }
-
-private:
-    MmLog() = default;
-    std::mutex m_;
-    std::ofstream ofs_;
-};
+/* simpele append-logger voor MM PDUs */
+static inline void mm_log(const char *line)
+{
+    FILE *f = fopen("tetra_mm.log", "a");
+    if (!f) return;
+    fprintf(f, "%s\n", line);
+    fclose(f);
+}
