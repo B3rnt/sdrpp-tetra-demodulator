@@ -9,11 +9,12 @@
 
 #include "tetra_mle_pdu.h"
 #include "tetra_mle.h"
+#include "mm_log.h"
 #include "tetra_mm_pdu.h"
 #include "tetra_cmce_pdu.h"
 #include "tetra_sndcp_pdu.h"
 #include "tetra_mle_pdu.h"
-#include "mm_log.h"   // toevoegen bovenin
+
 
 //TODO: stole D-* parser from sq5bpf
 
