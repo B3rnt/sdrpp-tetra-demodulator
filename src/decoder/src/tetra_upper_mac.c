@@ -35,8 +35,43 @@
 // #include "tetra_llc_pdu.h"
 // #include "tetra_llc.h"
 
+/* >>> ADDED: for MLE/MM bypass logging */
+#include "tetra_mle.h"   /* rx_tl_sdu() */
+#include "mm_log.h"      /* mm_log() */
+/* <<< ADDED */
+
 /* FIXME move global fragslots to context variable */
 // struct fragslot fragslots[FRAGSLOT_NR_SLOTS] = {0};
+
+/* ---------------------------------------------------------
+ * DEBUG BYPASS: stuur L2 payload direct naar MLE (TL-SDU)
+ * Hiermee krijg je PDISC/MM output zonder LLC te fixen.
+ * --------------------------------------------------------- */
+static void try_decode_to_mle(struct tetra_mac_state *tms, struct msgb *msg)
+{
+	if (!tms || !msg || !msg->l2h)
+		return;
+
+	unsigned int l2len = (unsigned int)msgb_l2len(msg);
+	if (l2len == 0)
+		return;
+
+	/* Meestal zitten MM/CMCE op control signalling.
+	   Op traffic bursts decode je meestal niets nuttigs, behalve “stolen” blocks. */
+	if (tms->cur_burst.is_traffic &&
+	    !tms->cur_burst.blk1_stolen &&
+	    !tms->cur_burst.blk2_stolen) {
+		return;
+	}
+
+	/* Bypass LLC: behandel l2h alsof dit TL-SDU is */
+	msg->l3h = msg->l2h;
+
+	/* Optional: uncomment to verify path is hit */
+	/* mm_log("try_decode_to_mle: calling rx_tl_sdu()"); */
+
+	(void)rx_tl_sdu(tms, msg, l2len);
+}
 
 void init_fragslot(struct fragslot *fragslot)
 {
@@ -242,24 +277,6 @@ static int rx_resrc(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
 
 	/* We now have accurate length and start of TM-SDU, set LLC start in msg->l2h */
 	msg->l2h = msg->l1h + tmpdu_offset;
-	// printf("RESOURCE Encr=%u%s len_field=%d l1_len=%d l2_len=%d Addr=%s",
-		// rsd.encryption_mode,
-		// rsd.encryption_mode && !rsd.is_encrypted ? " DECRYPTED" : "",
-		// rsd.macpdu_length, msgb_l1len(msg), msgb_l2len(msg),
-		// tetra_addr_dump(&rsd.addr));
-
-	if (rsd.chan_alloc_pres) {
-		if (!rsd.is_encrypted) {
-			// printf(" ChanAlloc=%s", tetra_alloc_dump(&rsd.cad, tms));
-		} else {
-			// printf(" ChanAlloc=ENCRYPTED");
-		}
-	}
-
-	if (rsd.slot_granting.pres) {
-		// printf(" SlotGrant=%u/%u", rsd.slot_granting.nr_slots,
-			// rsd.slot_granting.delay);
-	}
 
 	if (rsd.addr.type == ADDR_TYPE_NULL) {
 		pdu_bits = -1; /* No more PDUs in slot */
@@ -278,8 +295,9 @@ static int rx_resrc(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
 	// printf(": %s\n", osmo_ubit_dump(msg->l2h, msgb_l2len(msg)));
 	if (rsd.macpdu_length != MACPDU_LEN_START_FRAG || !REASSEMBLE_FRAGMENTS) {
 		/* Non-fragmented resource (or no reassembly desired) */
-		// rx_tm_sdu(tms, msg, msgb_l2len(msg));
-		//TODO: fix llc
+		/* >>> ADDED: bypass LLC and feed directly into MLE/TL-SDU decoder */
+		try_decode_to_mle(tms, msg);
+		/* <<< ADDED */
 	} else {
 		/* Fragmented resource */
 		slot = tmvp->u.unitdata.tdma_time.tn;
@@ -298,7 +316,6 @@ static int rx_resrc(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
 		fragmsgb->l3h = 0;
 		memcpy(fragmsgb->l2h, msg->l2h, msgb_l2len(msg));
 
-		// printf("\nFRAG-START slot=%d len=%d msgb=%s\n", slot, msgb_l2len(fragmsgb), osmo_ubit_dump(fragmsgb->l2h, msgb_l2len(msg)));
 		tms->fragslots[slot].active = 1;
 		tms->fragslots[slot].num_frags = 1;
 		tms->fragslots[slot].length = msgb_l2len(msg);
@@ -307,7 +324,6 @@ static int rx_resrc(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
 	}
 
 out:
-	// printf("\n");
 	return pdu_bits;
 }
 
@@ -316,7 +332,6 @@ void append_frag_bits(struct tetra_mac_state *tms, int slot, uint8_t *bits, int 
 	struct msgb *fragmsgb;
 	fragmsgb = tms->fragslots[slot].msgb;
 	if (fragmsgb->len + bitlen > fragmsgb->data_len) {
-		// printf(" WARNING: FRAG LENGTH ERROR!\n");
 		return;
 	}
 	unsigned char *append_ptr = msgb_put(fragmsgb, bitlen);
@@ -357,7 +372,6 @@ static int rx_macfrag(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tm
 
 		/* Add frag to fragslot buffer */
 		append_frag_bits(tms, slot, msg->l2h, msgb_l2len(msg));
-		// printf("FRAG-CONT slot=%d added=%d msgb=%s\n", slot, msgb_l2len(msg), osmo_ubit_dump(fragmsgb->l2h, msgb_l2len(fragmsgb)));
 	} else {
 		// printf("WARNING got fragment without start packet for slot=%d\n", slot);
 	}
@@ -414,21 +428,19 @@ static int rx_macend(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms
 
 		msg->l2h = msg->l1h + n;
 		append_frag_bits(tms, slot, msg->l2h, msgb_l2len(msg));
-		// printf("FRAG-END slot=%d added=%d msgb=%s\n", slot, msgb_l2len(msg), osmo_ubit_dump(fragmsgb->l2h, msgb_l2len(fragmsgb)));
 
 		/* Message is completed inside fragmsgb now */
 		if (!tms->fragslots[slot].encryption || tms->fragslots[slot].key) {
-			// rx_tm_sdu(tms, fragmsgb, tms->fragslots[slot].length);
-			//TODO: FIX LLC
+			/* >>> ADDED: bypass LLC and feed reassembled payload into MLE/TL-SDU decoder */
+			fragmsgb->l3h = fragmsgb->l2h;
+			try_decode_to_mle(tms, fragmsgb);
+			/* <<< ADDED */
 		}
-	} else {
-		// printf("FRAG: got end frag with len %d without start packet for slot=%d\n", length_indicator * 8, slot);
 	}
 
 	cleanup_fragslot(&tms->fragslots[slot]);
 	return length_indicator * 8;
 }
-
 
 static int rx_suppl(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
 {
@@ -450,14 +462,12 @@ static int rx_suppl(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
 	}
 #endif
 
-	// printf("SUPPLEMENTARY MAC-D-BLOCK ");
-
-	//if (sud.encryption_mode == 0)
 	msg->l2h = msg->l1h + tmpdu_offset;
-	// rx_tm_sdu(tms, msg, 100);
-	//TODO: FIX LLC
 
-	// printf("\n");
+	/* >>> ADDED: bypass LLC and feed directly into MLE/TL-SDU decoder */
+	try_decode_to_mle(tms, msg);
+	/* <<< ADDED */
+
 	return -1; /* TODO FIXME check length */
 }
 
@@ -470,8 +480,6 @@ static void rx_aach(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
 {
 	struct tmv_unitdata_param *tup = &tmvp->u.unitdata;
 	struct tetra_acc_ass_decoded aad;
-
-	// printf("ACCESS-ASSIGN PDU: ");
 
 	memset(&aad, 0, sizeof(aad));
 	macpdu_decode_access_assign(&aad, tmvp->oph.msg->l1h,
@@ -488,11 +496,9 @@ static void rx_aach(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
 		tms->t_display_st->access2 = (aad.access[1].base_frame_len);
 	}
 	if (aad.pres & TETRA_ACC_ASS_PRES_DL_USAGE) {
-		// printf("DL_USAGE: %s ", tetra_get_dl_usage_name(aad.dl_usage));
 		tms->t_display_st->dl_usage = aad.dl_usage;
 	}
 	if (aad.pres & TETRA_ACC_ASS_PRES_UL_USAGE) {
-		// printf("UL_USAGE: %s ", tetra_get_ul_usage_name(aad.ul_usage));
 		tms->t_display_st->ul_usage = aad.ul_usage;
 	}
 
@@ -506,8 +512,6 @@ static void rx_aach(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
 	/* Reset slot stealing flags */
 	tms->cur_burst.blk1_stolen = false;
 	tms->cur_burst.blk2_stolen = false;
-
-	// printf("\n");
 }
 
 static int rx_tmv_unitdata_ind(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
@@ -527,21 +531,13 @@ static int rx_tmv_unitdata_ind(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_
 		pdu_name = tetra_get_macpdu_name(pdu_type);
 	}
 
-	// printf("TMV-UNITDATA.ind %s %s CRC=%u %s\n",
-		// tetra_tdma_time_dump(&tup->tdma_time),
-		// tetra_get_lchan_name(tup->lchan),
-		// tup->crc_ok, pdu_name);
-
 	if (!tup->crc_ok)
 		return -1;
 
-
 	if (tup->tdma_time.fn == 18 && REASSEMBLE_FRAGMENTS)
-		/* Age out old fragments */
-		/* FIXME: also age out old event labels */
 		age_fragslots(tms);
 
-	len_parsed = -1; /* Default for cases where slot is filled or otherwise irrelevant */
+	len_parsed = -1;
 	switch (tup->lchan) {
 	case TETRA_LC_AACH:
 		rx_aach(tmvp, tms);
@@ -567,28 +563,23 @@ static int rx_tmv_unitdata_ind(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_
 					len_parsed = rx_macend(tmvp, tms);
 				}
 			} else {
-				len_parsed = -1; /* Can't determine len */
+				len_parsed = -1;
 				if (msg->l1h[3] == TETRA_MAC_FRAGE_FRAG) {
-					// printf("FRAG/END FRAG: ");
 					msg->l2h = msg->l1h+4;
-					// rx_tm_sdu(tms, msg, 100 /*FIXME*/);
-					//TODO: FIX LLC
-					// printf("\n");
-				} else {
-					// printf("FRAG/END END\n");
+					/* >>> ADDED: bypass LLC (even without reassembly) */
+					try_decode_to_mle(tms, msg);
+					/* <<< ADDED */
 				}
 			}
 			break;
 		default:
-			len_parsed = -1; /* Can't determine len */
-			// printf("STRANGE pdu=%u\n", pdu_type);
+			len_parsed = -1;
 			break;
 		}
 		break;
 	case TETRA_LC_BSCH:
 		break;
 	default:
-		// printf("STRANGE lchan=%u\n", tup->lchan);
 		break;
 	}
 
@@ -607,7 +598,6 @@ int upper_mac_prim_recv(struct osmo_prim_hdr *op, void *priv)
 		pdu_bits = rx_tmv_unitdata_ind(tmvp, tms);
 		break;
 	default:
-		// printf("primitive on unknown sap\n");
 		break;
 	}
 
