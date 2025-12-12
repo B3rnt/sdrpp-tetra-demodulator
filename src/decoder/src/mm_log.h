@@ -1,7 +1,7 @@
 #pragma once
 #include <mutex>
-#include <string>
 #include <fstream>
+#include <string>
 
 class MmLog {
 public:
@@ -10,8 +10,7 @@ public:
         return s;
     }
 
-    // schrijft altijd "append" naar tetra_mm.log (zelfde folder als sdrpp.exe als je SDR++ daar start)
-    void write_line(const std::string& line) {
+    void log(const std::string& line) {
         std::lock_guard<std::mutex> lk(m_);
         if (!ofs_.is_open()) {
             ofs_.open("tetra_mm.log", std::ios::out | std::ios::app);
