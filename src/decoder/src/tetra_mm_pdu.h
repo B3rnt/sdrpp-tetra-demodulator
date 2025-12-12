@@ -35,6 +35,17 @@ enum tetra_mm_loc_upd_acc_type {
 	TMM_LUPD_ACC_T_DISABLED		= 7
 };
 
-const char *tetra_get_mm_pdut_name(uint8_t pdut, int uplink);
+const char *tetra_get_mm_pdut_name(uint8_t pdu_type, int uplink)
+{
+    (void)uplink;
+    const char *name = get_value_string(mm_pdut_d_names, pdu_type);
+
+    char buf[128];
+    if (name) snprintf(buf, sizeof(buf), "MM PDU: %s", name);
+    else      snprintf(buf, sizeof(buf), "MM PDU: UNKNOWN(0x%X)", pdu_type);
+
+    mm_log(buf);
+    return name ? name : "UNKNOWN";
+}
 
 #endif
