@@ -49,28 +49,48 @@
  * --------------------------------------------------------- */
 static void try_decode_to_mle(struct tetra_mac_state *tms, struct msgb *msg)
 {
-	if (!tms || !msg || !msg->l2h)
-		return;
+    if (!tms || !msg || !msg->l2h)
+        return;
 
-	unsigned int l2len = (unsigned int)msgb_l2len(msg);
-	if (l2len == 0)
-		return;
+    unsigned int l2len = (unsigned int)msgb_l2len(msg);
+    if (l2len == 0)
+        return;
 
-	/* Meestal zitten MM/CMCE op control signalling.
-	   Op traffic bursts decode je meestal niets nuttigs, behalve “stolen” blocks. */
-	if (tms->cur_burst.is_traffic &&
-	    !tms->cur_burst.blk1_stolen &&
-	    !tms->cur_burst.blk2_stolen) {
-		return;
-	}
+    /* Meestal zitten MM/CMCE op control signalling.
+       Op traffic bursts decode je meestal niets nuttigs, behalve “stolen” blocks. */
+    if (tms->cur_burst.is_traffic &&
+        !tms->cur_burst.blk1_stolen &&
+        !tms->cur_burst.blk2_stolen) {
+        return;
+    }
 
-	/* Bypass LLC: behandel l2h alsof dit TL-SDU is */
-	msg->l3h = msg->l2h;
+    /* Bypass LLC: behandel l2h alsof dit TL-SDU is */
+    msg->l3h = msg->l2h;
 
-	/* Optional: uncomment to verify path is hit */
-	/* mm_log("try_decode_to_mle: calling rx_tl_sdu()"); */
+    /* --- ADDED: log PDISC + ISSI/SSI context --- */
+    if (l2len >= 1) {
+        uint8_t pdisc = msg->l3h[0] & 0x0F;
 
-	(void)rx_tl_sdu(tms, msg, l2len);
+        if (pdisc == 1) { /* MM */
+            char buf[256];
+
+            if (tms->addr_type != ADDR_TYPE_NULL && tms->ssi != 0) {
+                snprintf(buf, sizeof(buf),
+                         "MLE PDISC=1 (MM) ISSI=%u (0x%06X) addr_type=%u usage=%u",
+                         (unsigned)tms->ssi, (unsigned)tms->ssi,
+                         (unsigned)tms->addr_type, (unsigned)tms->usage_marker);
+            } else {
+                snprintf(buf, sizeof(buf),
+                         "MLE PDISC=1 (MM) ISSI=UNKNOWN addr_type=%u usage=%u",
+                         (unsigned)tms->addr_type, (unsigned)tms->usage_marker);
+            }
+
+            mm_log(buf);
+        }
+    }
+    /* --- END ADDED --- */
+
+    (void)rx_tl_sdu(tms, msg, l2len);
 }
 
 void init_fragslot(struct fragslot *fragslot)
