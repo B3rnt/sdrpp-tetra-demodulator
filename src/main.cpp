@@ -7,8 +7,11 @@
 #include <gui/gui.h>
 #include <signal_path/signal_path.h>
 #include <module.h>
-// #include <unistd.h>
 #include <fstream>
+#include <cmath>
+
+// NEW: for absolute tuning like frequency_manager does
+#include <tuner/tuner.h>
 
 #include <dsp/demod/psk.h>
 #include <dsp/buffer/packer.h>
@@ -28,7 +31,6 @@
 #include "dsp/pi4dqpsk.h"
 #include "dsp/osmotetra_dec.h"
 #include "gui_widgets.h"
-
 
 #define CONCAT(a, b)    ((std::string(a) + b).c_str())
 
@@ -65,28 +67,50 @@ public:
             config.conf[name]["hostname"] = "localhost";
             config.conf[name]["port"] = 8355;
             config.conf[name]["sending"] = false;
+
+            // NEW: per instance absolute tune
+            config.conf[name]["lock_tune"] = false;
+            config.conf[name]["tune_mhz"] = 0.0; // 0 = disabled / not set
         }
         decoder_mode = config.conf[name]["mode"];
         strcpy(hostname, std::string(config.conf[name]["hostname"]).c_str());
         port = config.conf[name]["port"];
         bool startNow = config.conf[name]["sending"];
+
+        // NEW:
+        lock_tune = config.conf[name].value("lock_tune", false);
+        tune_mhz  = config.conf[name].value("tune_mhz", 0.0);
+
         config.release(true);
 
-        vfo = sigpath::vfoManager.createVFO(name, ImGui::WaterfallVFO::REF_CENTER, 0, VFO_BANDWIDTH, VFO_SAMPLERATE, VFO_BANDWIDTH, VFO_BANDWIDTH, true);
+        vfo = sigpath::vfoManager.createVFO(
+            name,
+            ImGui::WaterfallVFO::REF_CENTER,
+            0,
+            VFO_BANDWIDTH,
+            VFO_SAMPLERATE,
+            VFO_BANDWIDTH,
+            VFO_BANDWIDTH,
+            true
+        );
 
         //Clock recov coeffs
         float recov_bandwidth = CLOCK_RECOVERY_BW;
         float recov_dampningFactor = CLOCK_RECOVERY_DAMPN_F;
-        float recov_denominator = (1.0f + 2.0*recov_dampningFactor*recov_bandwidth + recov_bandwidth*recov_bandwidth);
+        float recov_denominator = (1.0f + 2.0f*recov_dampningFactor*recov_bandwidth + recov_bandwidth*recov_bandwidth);
         float recov_mu = (4.0f * recov_dampningFactor * recov_bandwidth) / recov_denominator;
         float recov_omega = (4.0f * recov_bandwidth * recov_bandwidth) / recov_denominator;
 
-        mainDemodulator.init(vfo->output, 18000, VFO_SAMPLERATE, RRC_TAP_COUNT, RRC_ALPHA, AGC_RATE, COSTAS_LOOP_BANDWIDTH, FLL_LOOP_BANDWIDTH, recov_omega, recov_mu, CLOCK_RECOVERY_REL_LIM);
+        mainDemodulator.init(vfo->output, 18000, VFO_SAMPLERATE, RRC_TAP_COUNT, RRC_ALPHA, AGC_RATE,
+                             COSTAS_LOOP_BANDWIDTH, FLL_LOOP_BANDWIDTH, recov_omega, recov_mu, CLOCK_RECOVERY_REL_LIM);
+
         constDiagSplitter.init(&mainDemodulator.out);
         constDiagSplitter.bindStream(&constDiagStream);
         constDiagSplitter.bindStream(&demodStream);
+
         constDiagReshaper.init(&constDiagStream, 1024, 0);
         constDiagSink.init(&constDiagReshaper.out, _constDiagSinkHandler, this);
+
         symbolExtractor.init(&demodStream);
         bitsUnpacker.init(&symbolExtractor.out);
 
@@ -114,6 +138,9 @@ public:
         stream.start();
         gui::menu.registerEntry(name, menuHandler, this, this);
 
+        // NEW: apply initial tune if enabled
+        applyTuneIfLocked();
+
         if(startNow) {
             startNetwork();
         }
@@ -132,6 +159,7 @@ public:
     void enable() {
         vfo = sigpath::vfoManager.createVFO(name, ImGui::WaterfallVFO::REF_CENTER, 0, 29000, 36000, 29000, 29000, true);
         mainDemodulator.setInput(vfo->output);
+
         mainDemodulator.start();
         constDiagSplitter.start();
         constDiagReshaper.start();
@@ -144,6 +172,9 @@ public:
         stream.start();
 
         enabled = true;
+
+        // NEW: re-apply tune on enable
+        applyTuneIfLocked();
     }
 
     void disable() {
@@ -167,6 +198,21 @@ public:
     }
 
 private:
+    // NEW: tune this instance's VFO to an absolute frequency (MHz)
+    void applyTuneIfLocked() {
+        if (!lock_tune) return;
+        if (!(tune_mhz > 0.0)) return; // ignore 0 / unset
+
+        const double freqHz = tune_mhz * 1e6;
+
+        // This is how frequency_manager tunes a given VFO/radio by name. :contentReference[oaicite:2]{index=2}
+        try {
+            tuner::tune(tuner::TUNER_MODE_NORMAL, name, freqHz);
+        } catch (...) {
+            // Some builds might throw; keep plugin alive.
+            flog::error("TETRA: tune failed for %s to %.6f MHz\n", name.c_str(), tune_mhz);
+        }
+    }
 
     void startNetwork() {
         stopNetwork();
@@ -204,6 +250,40 @@ private:
             style::beginDisabled();
         }
 
+        // =========================
+        // NEW: Absolute frequency per instance
+        // =========================
+        ImGui::SeparatorText("Frequency (per instance)");
+
+        bool lock = _this->lock_tune;
+        if (ImGui::Checkbox(CONCAT("Lock tune##_", _this->name), &lock)) {
+            _this->lock_tune = lock;
+
+            config.acquire();
+            config.conf[_this->name]["lock_tune"] = _this->lock_tune;
+            config.release(true);
+
+            _this->applyTuneIfLocked();
+        }
+
+        double mhz = _this->tune_mhz;
+        ImGui::SetNextItemWidth(menuWidth);
+        // step: 25 kHz = 0.025 MHz; fine step: 1 kHz = 0.001 MHz; adjust as you like
+        if (ImGui::InputDouble(CONCAT("Tune to (MHz)##_", _this->name), &mhz, 0.0125, 0.1, "%.6f")) {
+            _this->tune_mhz = mhz;
+
+            config.acquire();
+            config.conf[_this->name]["tune_mhz"] = _this->tune_mhz;
+            config.release(true);
+
+            _this->applyTuneIfLocked();
+        }
+
+        ImGui::TextDisabled("Example: 392.312500 = 392,312,500 Hz");
+
+        ImGui::Separator();
+
+        // Existing UI
         ImGui::Text("Signal constellation: ");
         ImGui::SetNextItemWidth(menuWidth);
         _this->constDiag.draw();
@@ -248,28 +328,14 @@ private:
             ImGui::Text("Timeslots: ");
             for(int i = 0; i < 4; i++) {
                 switch(_this->osmotetradecoder.getTimeslotContent(i)) {
-                    case 0:
-                        ImGui::SameLine();
-                        ImGui::TextColored(ImVec4(0.8, 0.8, 0.8, 1.0), "   UL  ");
-                        break;
-                    case 1:
-                        ImGui::SameLine();
-                        ImGui::TextColored(ImVec4(0.95, 0.05, 0.95, 1.0), " DATA  ");
-                        break;
-                    case 2:
-                        ImGui::SameLine();
-                        ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "  NDB  ");
-                        break;
-                    case 3:
-                        ImGui::SameLine();
-                        ImGui::TextColored(ImVec4(0.05, 0.95, 0.95, 1.0), " SYNC  ");
-                        break;
-                    case 4:
-                        ImGui::SameLine();
-                        ImGui::TextColored(ImVec4(0.05, 0.95, 0.05, 1.0), " VOICE ");
-                        break;
+                    case 0: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.8, 0.8, 0.8, 1.0), "   UL  "); break;
+                    case 1: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.95, 0.05, 0.95, 1.0), " DATA  "); break;
+                    case 2: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "  NDB  "); break;
+                    case 3: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.05, 0.95, 0.95, 1.0), " SYNC  "); break;
+                    case 4: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.05, 0.95, 0.05, 1.0), " VOICE "); break;
                 }
             }
+
             int crc_failed = _this->osmotetradecoder.getLastCrcFail();
             if(crc_failed) {
                 ImGui::BoxIndicator(ImGui::GetFontSize()*2, IM_COL32(230, 5, 5, 255));
@@ -283,16 +349,20 @@ private:
                 ImGui::Text(" CRC: "); ImGui::SameLine();
                 ImGui::TextColored(ImVec4(0.05, 0.95, 0.05, 1.0), "PASS");
             }
+
             int dl_usg = _this->osmotetradecoder.getDlUsage();
             int ul_usg = _this->osmotetradecoder.getUlUsage();
+
             ImGui::Text("DL:");ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%7.3f", ((float)_this->osmotetradecoder.getDlFreq()/1000000.0f));ImGui::SameLine();
             ImGui::Text(" MHz ");ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), (dl_usg == 0 ? "Unalloc" : (dl_usg == 1 ? "Assigned ctl" : (dl_usg == 2 ? "Common ctl" : (dl_usg == 3 ? "Reserved" : "Traffic")))));
+
             ImGui::Text("UL:");ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%7.3f", ((float)_this->osmotetradecoder.getUlFreq()/1000000.0f));ImGui::SameLine();
             ImGui::Text(" MHz ");ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), (ul_usg == 0 ? "Unalloc" : "Traffic"));
+
             ImGui::Text("Access1: ");ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%c", _this->osmotetradecoder.getAccess1Code());ImGui::SameLine();
             ImGui::Text("/");ImGui::SameLine();
@@ -301,12 +371,14 @@ private:
             ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%c", _this->osmotetradecoder.getAccess2Code());ImGui::SameLine();
             ImGui::Text("/");ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%d", _this->osmotetradecoder.getAccess2());
+
             ImGui::Text("MCC: ");ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%03d", _this->osmotetradecoder.getMcc());ImGui::SameLine();
             ImGui::Text("| MNC: ");ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%03d", _this->osmotetradecoder.getMnc());ImGui::SameLine();
             ImGui::Text("| CC: ");ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "0x%02x", _this->osmotetradecoder.getCc());
+
             ImVec4 on_color = ImVec4(0.05, 0.95, 0.05, 1.0);
             ImVec4 off_color = ImVec4(0.95, 0.05, 0.05, 1.0);
             ImGui::TextColored(_this->osmotetradecoder.getAdvancedLink() ? on_color : off_color, "Adv. link  ");ImGui::SameLine();
@@ -320,12 +392,10 @@ private:
             ImGui::TextColored(_this->osmotetradecoder.getPriorityCell() ? on_color : off_color, "Priority cell");
             ImGui::TextColored(_this->osmotetradecoder.getDeregMandatory() ? on_color : off_color, "Dereg req.  ");ImGui::SameLine();
             ImGui::TextColored(_this->osmotetradecoder.getRegMandatory() ? on_color : off_color, "Reg req.");
-            if(crc_failed) {
-                style::endDisabled();
-            }
-            if(dec_st != 2) {
-                style::endDisabled();
-            }
+
+            if(crc_failed) { style::endDisabled(); }
+            if(dec_st != 2) { style::endDisabled(); }
+
         } else {
             //NETWORK SYM STREAMING
             ImGui::BoxIndicator(menuWidth, _this->tsfound ? IM_COL32(5, 230, 5, 255) : IM_COL32(230, 5, 5, 255));
@@ -368,6 +438,7 @@ private:
                 ImGui::TextUnformatted("Idle");
             }
         }
+
         if(!_this->enabled) {
             style::endDisabled();
         }
@@ -448,24 +519,22 @@ private:
     SinkManager::Stream stream;
     double audioSampleRate = 48000.0;
 
-
     int decoder_mode = 0;
 
+    // NEW: absolute tuning state
+    bool lock_tune = false;
+    double tune_mhz = 0.0;
 
     //Sequences from osmo-tetra-sq5bpf source
-    /* 9.4.4.3.2 Normal Training Sequence */
     static const constexpr uint8_t training_seq_n[22] = { 1,1, 0,1, 0,0, 0,0, 1,1, 1,0, 1,0, 0,1, 1,1, 0,1, 0,0 };
     static const constexpr uint8_t training_seq_p[22] = { 0,1, 1,1, 1,0, 1,0, 0,1, 0,0, 0,0, 1,1, 0,1, 1,1, 1,0 };
     static const constexpr uint8_t training_seq_q[22] = { 1,0, 1,1, 0,1, 1,1, 0,0, 0,0, 0,1, 1,0, 1,0, 1,1, 0,1 };
     static const constexpr uint8_t training_seq_N[33] = { 1,1,1, 0,0,1, 1,0,1, 1,1,1, 0,0,0, 1,1,1, 1,0,0, 0,1,1, 1,1,0, 0,0,0, 0,0,0 };
     static const constexpr uint8_t training_seq_P[33] = { 1,0,1, 0,1,1, 1,1,1, 1,0,1, 0,1,0, 1,0,1, 1,1,0, 0,0,1, 1,0,0, 0,1,0, 0,1,0 };
-
-    /* 9.4.4.3.3 Extended training sequence */
     static const constexpr uint8_t training_seq_x[30] = { 1,0, 0,1, 1,1, 0,1, 0,0, 0,0, 1,1, 1,0, 1,0, 0,1, 1,1, 0,1, 0,0, 0,0, 1,1 };
     static const constexpr uint8_t training_seq_X[45] = { 0,1,1,1,0,0,1,1,0,1,0,0,0,0,1,0,0,0,1,1,1,0,1,1,0,1,0,1,0,1,1,1,1,1,0,1,0,0,0,0,0,1,1,1,0 };
-
-    /* 9.4.4.3.4 Synchronization training sequence */
     static const constexpr uint8_t training_seq_y[38] = { 1,1, 0,0, 0,0, 0,1, 1,0, 0,1, 1,1, 0,0, 1,1, 1,0, 1,0, 0,1, 1,1, 0,0, 0,0, 0,1, 1,0, 0,1, 1,1 };
+
     uint8_t tsfind_buffer[45];
     bool tsfound = false;
     int symsbeforeexpire = 0;
@@ -474,7 +543,6 @@ private:
     int port = 8355;
 
     std::shared_ptr<net::Socket> conn;
-
 };
 
 MOD_EXPORT void _INIT_() {
