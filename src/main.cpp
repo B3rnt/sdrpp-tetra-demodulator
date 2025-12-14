@@ -38,7 +38,7 @@
 #define CONCAT(a, b)    ((std::string(a) + b).c_str())
 
 #define VFO_SAMPLERATE 36000
-#define VFO_BANDWIDTH 30000
+#define VFO_BANDWIDTH 25000
 #define CLOCK_RECOVERY_BW 0.00628f
 #define CLOCK_RECOVERY_DAMPN_F 0.707f
 #define CLOCK_RECOVERY_REL_LIM 0.02f
@@ -494,12 +494,10 @@ private:
             ImGui::TextColored(_this->osmotetradecoder.getDeregMandatory() ? on_color : off_color, "Dereg req.  "); ImGui::SameLine();
             ImGui::TextColored(_this->osmotetradecoder.getRegMandatory() ? on_color : off_color, "Reg req.");
 			}
-            if (crc_failed) {
-                style::endDisabled();
-            }
-            if (dec_st != 2) {
-                style::endDisabled();
-            }
+			if (dec_st != 2) {
+				style::endDisabled();
+			}
+
 
         } else {
             // =========================
