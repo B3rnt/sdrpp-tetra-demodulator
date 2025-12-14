@@ -6,31 +6,24 @@
 #include <stdarg.h>
 
 #ifndef MM_LOG_PATH
-/* Pas dit pad aan als je ergens anders wil loggen */
 #define MM_LOG_PATH "mm_log.txt"
 #endif
 
-/* 0xFFFFFF = 16777215 -> vaak broadcast/unknown placeholder */
-#ifndef MM_BROADCAST_ISSI
 #define MM_BROADCAST_ISSI 0xFFFFFFu
-#endif
 
-/* Default: drop spam met 0xFFFFFF */
-static int g_drop_broadcast_issi = 1;
-
-void mm_log_set_drop_broadcast_issi(int drop)
+/* Drop ALLES wat 0xFFFFFF is (ook als het per ongeluk extra info bevat) */
+static int is_broadcast_text(const char *line)
 {
-    g_drop_broadcast_issi = (drop ? 1 : 0);
-}
-
-int mm_log_get_drop_broadcast_issi(void)
-{
-    return g_drop_broadcast_issi;
+    if (!line) return 0;
+    return (strstr(line, "ISSI=16777215") != NULL) || (strstr(line, "0xFFFFFF") != NULL);
 }
 
 static void mm_write_line(const char *line)
 {
     if (!line || !*line) return;
+
+    /* String-based filter (voor jouw huidige logs die ISSI al in de tekst hebben) */
+    if (is_broadcast_text(line)) return;
 
     FILE *f = fopen(MM_LOG_PATH, "a");
     if (!f) return;
@@ -63,7 +56,6 @@ void mm_logf(const char *fmt, ...)
     if (!fmt || !*fmt) return;
 
     char buf[512];
-
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -74,10 +66,11 @@ void mm_logf(const char *fmt, ...)
 
 void mm_log_with_ctx(uint32_t issi, const char *line)
 {
-    if (g_drop_broadcast_issi && issi == MM_BROADCAST_ISSI) {
-        /* Drop spam */
-        return;
-    }
+    if (!line || !*line) return;
+
+    /* Context-based filter (beste oplossing) */
+    if (issi == MM_BROADCAST_ISSI) return;
+
     mm_write_line(line);
 }
 
@@ -85,13 +78,10 @@ void mm_logf_with_ctx(uint32_t issi, const char *fmt, ...)
 {
     if (!fmt || !*fmt) return;
 
-    if (g_drop_broadcast_issi && issi == MM_BROADCAST_ISSI) {
-        /* Drop spam */
-        return;
-    }
+    /* Context-based filter */
+    if (issi == MM_BROADCAST_ISSI) return;
 
     char buf[512];
-
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
