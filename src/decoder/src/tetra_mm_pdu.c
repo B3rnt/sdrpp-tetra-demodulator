@@ -1,23 +1,5 @@
 /* Implementation of TETRA MM PDU parsing */
 
-/* (C) 2011 by Harald Welte <laforge@gnumonks.org>
- * All Rights Reserved
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation; either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- */
-
 #include "tetra_common.h"
 #include "mm_log.h"
 #include "tetra_mm_pdu.h"
@@ -45,13 +27,14 @@ const char *tetra_mm_pdu_get_name(uint8_t pdu_type)
     return get_value_string(mm_pdut_d_names, pdu_type);
 }
 
-/* Optional: basic single-line log for a MM PDU type (still no SSI/GSSI/CAUSE). */
+/* Optional: basic single-line log for a MM PDU type */
 void tetra_mm_pdu_log_basic(uint32_t issi, uint8_t pdu_type)
 {
     const char *short_name = tetra_get_mm_pdut_name(pdu_type, 0);
-    /* This uses context-aware filter: drops 0xFFFFFF by default */
-    mm_logf_with_ctx(issi, "MM: %s (type=0x%X) ISSI=%u (0x%06X)",
+
+    /* mm_logf_with_ctx filters out ISSI==0xFFFFFF automatically */
+    mm_logf_with_ctx(issi,
+                     "MM: %s (type=0x%X)",
                      short_name ? short_name : "D-UNKNOWN",
-                     (unsigned)pdu_type,
-                     (unsigned)issi, (unsigned)(issi & 0xFFFFFFu));
+                     (unsigned)pdu_type);
 }
