@@ -106,6 +106,27 @@ static const int8_t bits2phase[] = {
 /* offset everything by 3 in order to get positive array index */
 #define PHASE(x)	((x)+3)
 struct phase2bits {
+
+static inline unsigned int train_seq_bit_errors(const uint8_t *a, const uint8_t *b, unsigned int len)
+{
+    unsigned int e = 0;
+    for (unsigned int i = 0; i < len; i++) {
+        /* bits are 0/1 */
+        e += (a[i] ^ b[i]) & 1;
+    }
+    return e;
+}
+
+/* Accept a limited number of bit errors in training sequences.
+ * This greatly improves burst sync on weaker signals (vs exact memcmp). */
+static inline unsigned int train_seq_max_errors(unsigned int len)
+{
+    /* conservative: allow ~15% errors, capped */
+    unsigned int m = (len + 6) / 7; /* ~14% */
+    if (m < 1) m = 1;
+    if (m > 4) m = 4;
+    return m;
+}
 	int8_t phase;
 	uint8_t bits[2];
 };
@@ -306,38 +327,77 @@ int tetra_find_train_seq(const uint8_t *in, unsigned int end_of_in,
 
 		unsigned remain_len = (unsigned int)((in + end_of_in) - cur);
 
+		/* best match at this position */
+		enum tetra_train_seq best_type = (enum tetra_train_seq)-1;
+		unsigned int best_err = 0xffffffff;
+		unsigned int off = (unsigned int)(cur - in);
+
+		/* NOTE: We require the full sequence to be present and allow a small number of bit errors.
+		 * This is much more robust than memcmp() on weak signals. */
 		if (mask_of_train_seq & (1 << TETRA_TRAIN_SYNC) &&
-		    remain_len >= sizeof(y_bits) &&
-		    !memcmp(cur, y_bits, sizeof(y_bits))) {
-			*offset = (unsigned int)(cur - in);
-			return TETRA_TRAIN_SYNC;
+		    remain_len >= sizeof(y_bits)) {
+			unsigned int e = train_seq_bit_errors(cur, y_bits, sizeof(y_bits));
+			if (e < best_err && e <= train_seq_max_errors(sizeof(y_bits))) {
+				best_err = e; best_type = TETRA_TRAIN_SYNC;
+			}
 		}
 		if (mask_of_train_seq & (1 << TETRA_TRAIN_NORM_1) &&
-		    remain_len >= sizeof(n_bits) &&
-		    !memcmp(cur, n_bits, sizeof(n_bits))) {
-			*offset = (unsigned int)(cur - in);
-			return TETRA_TRAIN_NORM_1;
+		    remain_len >= sizeof(n_bits)) {
+			unsigned int e = train_seq_bit_errors(cur, n_bits, sizeof(n_bits));
+			if (e < best_err && e <= train_seq_max_errors(sizeof(n_bits))) {
+				best_err = e; best_type = TETRA_TRAIN_NORM_1;
+			}
 		}
 		if (mask_of_train_seq & (1 << TETRA_TRAIN_NORM_2) &&
-		    remain_len >= sizeof(p_bits) &&
-		    !memcmp(cur, p_bits, sizeof(p_bits))) {
-			*offset = (unsigned int)(cur - in);
-			return TETRA_TRAIN_NORM_2;
+		    remain_len >= sizeof(p_bits)) {
+			unsigned int e = train_seq_bit_errors(cur, p_bits, sizeof(p_bits));
+			if (e < best_err && e <= train_seq_max_errors(sizeof(p_bits))) {
+				best_err = e; best_type = TETRA_TRAIN_NORM_2;
+			}
 		}
 		if (mask_of_train_seq & (1 << TETRA_TRAIN_NORM_3) &&
-		    remain_len >= sizeof(q_bits) &&
-		    !memcmp(cur, q_bits, sizeof(q_bits))) {
-			*offset = (unsigned int)(cur - in);
-			return TETRA_TRAIN_NORM_3;
+		    remain_len >= sizeof(q_bits)) {
+			unsigned int e = train_seq_bit_errors(cur, q_bits, sizeof(q_bits));
+			if (e < best_err && e <= train_seq_max_errors(sizeof(q_bits))) {
+				best_err = e; best_type = TETRA_TRAIN_NORM_3;
+			}
 		}
 		if (mask_of_train_seq & (1 << TETRA_TRAIN_EXT) &&
-		    remain_len >= sizeof(x_bits) &&
-		    !memcmp(cur, x_bits, sizeof(x_bits))) {
-			*offset = (unsigned int)(cur - in);
-			return TETRA_TRAIN_EXT;
+		    remain_len >= sizeof(x_bits)) {
+			unsigned int e = train_seq_bit_errors(cur, x_bits, sizeof(x_bits));
+			if (e < best_err && e <= train_seq_max_errors(sizeof(x_bits))) {
+				best_err = e; best_type = TETRA_TRAIN_EXT;
+			}
+		}
+
+		if (best_type != (enum tetra_train_seq)-1) {
+			*offset = off;
+			return best_type;
 		}
 	}
 	return -1;
+}
+
+
+static inline void push_ts_content(struct tetra_mac_state *tms, unsigned int tn_idx, uint8_t val)
+{
+    if (!tms || !tms->t_display_st || tn_idx >= 4) return;
+    uint8_t idx = tms->t_display_st->ts_hist_idx[tn_idx] % 5;
+    tms->t_display_st->ts_hist[tn_idx][idx] = val;
+    tms->t_display_st->ts_hist_idx[tn_idx] = (idx + 1) % 5;
+
+    /* majority vote over last 5 */
+    unsigned int counts[5] = {0};
+    for (unsigned int i = 0; i < 5; i++) {
+        uint8_t v = tms->t_display_st->ts_hist[tn_idx][i];
+        if (v < 5) counts[v]++;
+    }
+    uint8_t best = val;
+    unsigned int bestc = 0;
+    for (uint8_t v = 0; v < 5; v++) {
+        if (counts[v] > bestc) { bestc = counts[v]; best = v; }
+    }
+    tms->t_display_st->timeslot_content[tn_idx] = best;
 }
 
 void tetra_burst_rx_cb(const uint8_t *burst, unsigned int len, enum tetra_train_seq type, void *priv)
@@ -356,7 +416,7 @@ void tetra_burst_rx_cb(const uint8_t *burst, unsigned int len, enum tetra_train_
 		tp_sap_udata_ind(TPSAP_T_SB1, BLK_1, burst+SB_BLK1_OFFSET, SB_BLK1_BITS, priv);
 		tp_sap_udata_ind(TPSAP_T_BBK, 0,     burst+SB_BBK_OFFSET, SB_BBK_BITS, priv);
 		tp_sap_udata_ind(TPSAP_T_SB2, BLK_2, burst+SB_BLK2_OFFSET, SB_BLK2_BITS, priv);
-		tms->t_display_st->timeslot_content[t_phy_state.time.tn-1] = 3;
+		push_ts_content(tms, t_phy_state.time.tn-1, 3);
 		break;
 	case TETRA_TRAIN_NORM_2:
 		/* re-combine the broadcast block */
@@ -366,7 +426,7 @@ void tetra_burst_rx_cb(const uint8_t *burst, unsigned int len, enum tetra_train_
 		tp_sap_udata_ind(TPSAP_T_BBK, 0, bbk_buf, NDB_BBK_BITS, priv);
 		tp_sap_udata_ind(TPSAP_T_NDB, BLK_1, burst+NDB_BLK1_OFFSET, NDB_BLK_BITS, priv);
 		tp_sap_udata_ind(TPSAP_T_NDB, BLK_2, burst+NDB_BLK2_OFFSET, NDB_BLK_BITS, priv);
-		tms->t_display_st->timeslot_content[t_phy_state.time.tn-1] = 2;
+		push_ts_content(tms, t_phy_state.time.tn-1, 2);
 		break;
 	case TETRA_TRAIN_NORM_1:
 		/* re-combine the broadcast block */
@@ -379,15 +439,15 @@ void tetra_burst_rx_cb(const uint8_t *burst, unsigned int len, enum tetra_train_
 		tp_sap_udata_ind(TPSAP_T_BBK, 0, bbk_buf, NDB_BBK_BITS, priv);
 		tp_sap_udata_ind(TPSAP_T_SCH_F, 0, ndbf_buf, 2*NDB_BLK_BITS, priv);
 		if(!tms->cur_burst.is_traffic) {
-			tms->t_display_st->timeslot_content[t_phy_state.time.tn-1] = 1;
+			push_ts_content(tms, t_phy_state.time.tn-1, 1);
 		} else {
-			tms->t_display_st->timeslot_content[t_phy_state.time.tn-1] = 4;
+			push_ts_content(tms, t_phy_state.time.tn-1, 4);
 		}
 		break;
 	case TETRA_TRAIN_NORM_3:
 	case TETRA_TRAIN_EXT:
 		/* uplink training sequences, should not be encountered, ignore */
-		tms->t_display_st->timeslot_content[t_phy_state.time.tn-1] = 0;
+		push_ts_content(tms, t_phy_state.time.tn-1, 0);
 		break;
 	}
 }
