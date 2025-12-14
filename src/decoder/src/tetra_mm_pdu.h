@@ -39,7 +39,7 @@ enum tetra_mm_loc_upd_acc_type {
     TMM_LUPD_ACC_T_DISABLED     = 7
 };
 
-/* Returns a stable string (no allocation). uplink currently unused but kept for API compatibility. */
+/* Stable short-name helper */
 static inline const char *tetra_get_mm_pdut_name(uint8_t pdu_type, int uplink)
 {
     (void)uplink;
@@ -62,12 +62,8 @@ static inline const char *tetra_get_mm_pdut_name(uint8_t pdu_type, int uplink)
     }
 }
 
-/* Legacy API used by some code: returns value_string lookup. */
+/* Legacy API: returns long name from value_string table (NO logging here). */
 const char *tetra_mm_pdu_get_name(uint8_t pdu_type);
-
-/* Optional helper for basic one-line log (still no SSI/GSSI/CAUSE).
-   This will NOT log if ISSI==0xFFFFFF, due to mm_logf_with_ctx filtering. */
-void tetra_mm_pdu_log_basic(uint32_t issi, uint8_t pdu_type);
 
 #ifdef __cplusplus
 }
