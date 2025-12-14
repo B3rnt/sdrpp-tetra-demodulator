@@ -1,4 +1,5 @@
 #include "tetra_common.h"
+#include "mm_log.h"
 #include "tetra_mm_pdu.h"
 
 static const struct value_string mm_pdut_d_names[] = {
@@ -18,8 +19,20 @@ static const struct value_string mm_pdut_d_names[] = {
     { 0, NULL }
 };
 
-/* IMPORTANT: do NOT log here (prevents spam/double logs) */
+/* IMPORTANT: no logging here; just return name. */
 const char *tetra_mm_pdu_get_name(uint8_t pdu_type)
 {
     return get_value_string(mm_pdut_d_names, pdu_type);
+}
+
+/* Basic single-line log for a MM PDU type (no SSI/GSSI/CAUSE yet). */
+void tetra_mm_pdu_log_basic(uint32_t issi, uint8_t pdu_type)
+{
+    const char *short_name = tetra_get_mm_pdut_name(pdu_type, 0);
+    int la = mm_get_thread_la();
+
+    /* Drops ISSI=0xFFFFFF automatically inside logger */
+    mm_logf_ctx(issi, la, "MM %s (type=0x%X)",
+                short_name ? short_name : "D-UNKNOWN",
+                (unsigned)pdu_type);
 }
