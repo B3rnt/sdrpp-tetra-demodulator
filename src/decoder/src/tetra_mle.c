@@ -98,12 +98,16 @@ static int issi_is_real(uint32_t issi)
 
 int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
 {
-    /* In this fork, msg->l3h points to octets (not unpacked bits). The first octet contains:
-     *   high nibble: MM/CMCE/etc PDU type (if applicable)
-     *   low  nibble: MLE protocol discriminator (PDISC)
+    /* NOTE:
+     * In this project the TL-SDU sometimes arrives as:
+     *   A) unpacked bits: each byte is 0/1 (len == number of bits)
+     *   B) octets/bytes: regular packed bytes (len == number of bytes)
+     *
+     * Older forks assumed (B) and masked nibbles, which fails hard if (A) is actually passed in.
+     * This function now auto-detects and handles BOTH formats robustly.
      */
-    const uint8_t *oct = msg ? (const uint8_t *)msg->l3h : NULL;
-    if (!oct || len < 1)
+    const uint8_t *buf = msg ? (const uint8_t *)msg->l3h : NULL;
+    if (!buf || len < 1)
         return (int)len;
 
     uint32_t issi = 0;
@@ -116,7 +120,99 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
     if (!issi_is_real(issi))
         return (int)len;
 
-    /* Primary interpretation (as used by tetra_upper_mac.c debug): low nibble is PDISC */
+    /* ----- Helper lambdas (C89-friendly) ----- */
+    /* Detect "unpacked bits" representation: all bytes are 0/1 */
+    int unpacked = 1;
+    for (unsigned int i = 0; i < len; i++) {
+        if (buf[i] > 1) { unpacked = 0; break; }
+    }
+
+    if (unpacked) {
+        /* buf[] is bits (0/1). MLE protocol discriminator is 3 bits at offset 0. */
+        if (len < 3)
+            return (int)len;
+
+        /* MSB-first bit accumulation, same semantics as osmo-tetra bits_to_uint() */
+        uint8_t mle_pdisc = (uint8_t)(((buf[0] & 1u) << 2) | ((buf[1] & 1u) << 1) | (buf[2] & 1u));
+
+        mm_logf_ctx(issi, la, "MLE PDISC=%u (%s) [bits]",
+                    (unsigned)mle_pdisc,
+                    tetra_get_mle_pdisc_name(mle_pdisc));
+
+        /* PDISC=0 is RESERVED in TETRA MLE. Treat as decode error and dump bits. */
+        if (mle_pdisc == 0 || tetra_get_mle_pdisc_name(mle_pdisc) == NULL) {
+            char dump[256]; dump[0] = '\0';
+            unsigned int n = (len > 32) ? 32 : len;
+            for (unsigned int i = 0; i < n; i++) {
+                char tmp[4];
+                snprintf(tmp, sizeof(tmp), "%u", (unsigned)(buf[i] & 1u));
+                strncat(dump, tmp, sizeof(dump) - strlen(dump) - 1);
+            }
+            mm_logf_ctx(issi, la, "MLE PDISC=%u reserved/unknown, bits[0..%u]=%s",
+                        (unsigned)mle_pdisc, n ? (n - 1) : 0, dump);
+            return (int)len;
+        }
+
+        /* MM: next 4 bits are the MM PDU type (message type) */
+        if (mle_pdisc == TMLE_PDISC_MM) {
+            if (len < 7) {
+                mm_logf_ctx(issi, la, "MM too short (%u bits), skip", (unsigned)len);
+                return (int)len;
+            }
+
+            uint8_t pdu_type = (uint8_t)(((buf[3] & 1u) << 3) | ((buf[4] & 1u) << 2) |
+                                         ((buf[5] & 1u) << 1) |  (buf[6] & 1u));
+
+            /* Build MM bitstream for mm_try_pretty_log():
+             * [0..3]  = MM type bits (from buf[3..6])
+             * [4..]   = remaining MM bits (from buf[7..])
+             */
+            unsigned int mm_len_bits = 4 + (len - 7);
+            if (mm_len_bits > 4096) {
+                mm_logf_ctx(issi, la, "MM too long (%u bits), skip", mm_len_bits);
+                return (int)len;
+            }
+
+            uint8_t mm_bits[4096];
+            mm_bits[0] = (pdu_type >> 3) & 1u;
+            mm_bits[1] = (pdu_type >> 2) & 1u;
+            mm_bits[2] = (pdu_type >> 1) & 1u;
+            mm_bits[3] = (pdu_type >> 0) & 1u;
+
+            unsigned int o = 4;
+            for (unsigned int bi = 7; bi < len; bi++)
+                mm_bits[o++] = (buf[bi] & 1u);
+
+            const char *mm_short = tetra_get_mm_pdut_name(pdu_type, 0);
+            mm_logf_ctx(issi, la, "MM type=0x%X (%s) [bits]",
+                        (unsigned)pdu_type,
+                        mm_short ? mm_short : "D-UNKNOWN");
+
+            mm_try_pretty_log(issi, la, mm_bits, mm_len_bits);
+
+            /* Diagnostics for reserved/unknown types */
+            if (!mm_short) {
+                char dump[256]; dump[0] = '\0';
+                unsigned int n = (len > 64) ? 64 : len;
+                for (unsigned int i = 0; i < n; i++) {
+                    char tmp[4];
+                    snprintf(tmp, sizeof(tmp), "%u", (unsigned)(buf[i] & 1u));
+                    strncat(dump, tmp, sizeof(dump) - strlen(dump) - 1);
+                }
+                mm_logf_ctx(issi, la, "MM unknown, bits[0..%u]=%s",
+                            n ? (n - 1) : 0, dump);
+            }
+            return (int)len;
+        }
+
+        /* Non-MM PDISC (CMCE/SNDCP/etc.) not decoded in this fork */
+        return (int)len;
+    }
+
+    /* ----- Packed octets path ----- */
+    const uint8_t *oct = buf;
+
+    /* Primary interpretation: low nibble is PDISC, high nibble is PDU type */
     uint8_t mle_pdisc = (uint8_t)(oct[0] & 0x0F);
     uint8_t pdu_type  = (uint8_t)((oct[0] >> 4) & 0x0F);
 
@@ -127,22 +223,18 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
     int used_alt = 0;
     if ((mle_pdisc == 0 || tetra_get_mle_pdisc_name(mle_pdisc) == NULL) &&
         (mle_pdisc_alt != 0 && tetra_get_mle_pdisc_name(mle_pdisc_alt) != NULL)) {
-        /* Prefer alt if it yields a known discriminator */
         mle_pdisc = mle_pdisc_alt;
         pdu_type  = pdu_type_alt;
         used_alt = 1;
     }
 
-    mm_logf_ctx(issi, la, "MLE PDISC=%u (%s)%s",
+    mm_logf_ctx(issi, la, "MLE PDISC=%u (%s)%s [octets]",
                 (unsigned)mle_pdisc,
                 tetra_get_mle_pdisc_name(mle_pdisc),
                 used_alt ? " [nibble-swap]" : "");
 
-    /* If PDISC is reserved/unknown, log a short dump to help debug bit-slip/FEC issues */
     if (mle_pdisc == 0 || tetra_get_mle_pdisc_name(mle_pdisc) == NULL) {
-        char dump[256];
-        dump[0] = '\0';
-        /* dump first up to 16 bytes */
+        char dump[256]; dump[0] = '\0';
         unsigned int n = (len > 16) ? 16 : len;
         for (unsigned int i = 0; i < n; i++) {
             char tmp[8];
@@ -161,43 +253,38 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
          * followed by all bits of subsequent octets (MSB-first). Low nibble (PDISC) is excluded.
          */
         const unsigned int mm_len_bits = 4 + (len - 1) * 8;
-        /* cap to avoid huge stack allocations if something goes wrong */
         if (mm_len_bits > 4096) {
             mm_logf_ctx(issi, la, "MM too long (%u bits), skip", mm_len_bits);
             return (int)len;
         }
         uint8_t mm_bits[4096];
-        /* pdu_type bits MSB-first */
-        mm_bits[0] = (pdu_type >> 3) & 1;
-        mm_bits[1] = (pdu_type >> 2) & 1;
-        mm_bits[2] = (pdu_type >> 1) & 1;
-        mm_bits[3] = (pdu_type >> 0) & 1;
+        mm_bits[0] = (pdu_type >> 3) & 1u;
+        mm_bits[1] = (pdu_type >> 2) & 1u;
+        mm_bits[2] = (pdu_type >> 1) & 1u;
+        mm_bits[3] = (pdu_type >> 0) & 1u;
 
         unsigned int o = 4;
         for (unsigned int bi = 1; bi < len; bi++) {
             uint8_t b = oct[bi];
-            mm_bits[o++] = (b >> 7) & 1;
-            mm_bits[o++] = (b >> 6) & 1;
-            mm_bits[o++] = (b >> 5) & 1;
-            mm_bits[o++] = (b >> 4) & 1;
-            mm_bits[o++] = (b >> 3) & 1;
-            mm_bits[o++] = (b >> 2) & 1;
-            mm_bits[o++] = (b >> 1) & 1;
-            mm_bits[o++] = (b >> 0) & 1;
+            mm_bits[o++] = (b >> 7) & 1u;
+            mm_bits[o++] = (b >> 6) & 1u;
+            mm_bits[o++] = (b >> 5) & 1u;
+            mm_bits[o++] = (b >> 4) & 1u;
+            mm_bits[o++] = (b >> 3) & 1u;
+            mm_bits[o++] = (b >> 2) & 1u;
+            mm_bits[o++] = (b >> 1) & 1u;
+            mm_bits[o++] = (b >> 0) & 1u;
         }
 
         const char *mm_short = tetra_get_mm_pdut_name(pdu_type, 0);
-        mm_logf_ctx(issi, la, "MM type=0x%X (%s)",
+        mm_logf_ctx(issi, la, "MM type=0x%X (%s) [octets]",
                     (unsigned)pdu_type,
                     mm_short ? mm_short : "D-UNKNOWN");
 
-        /* Pretty SDR#-style status logs (authentication/roaming/etc.) */
         mm_try_pretty_log(issi, la, mm_bits, mm_len_bits);
 
-        /* If type is reserved/unknown, dump first bytes for diagnostics */
-        if (!mm_short || !strcmp(mm_short, "D-UNKNOWN") || pdu_type == 0x8 || pdu_type == 0xD || pdu_type == 0xE) {
-            char dump[256];
-            dump[0] = '\0';
+        if (!mm_short) {
+            char dump[256]; dump[0] = '\0';
             unsigned int n = (len > 16) ? 16 : len;
             for (unsigned int i = 0; i < n; i++) {
                 char tmp[8];
@@ -205,23 +292,15 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
                 strncat(dump, tmp, sizeof(dump) - strlen(dump) - 1);
                 if (i + 1 < n) strncat(dump, " ", sizeof(dump) - strlen(dump) - 1);
             }
-            mm_logf_ctx(issi, la, "MM diag octets[0..%u]=%s", n ? (n - 1) : 0, dump);
+            mm_logf_ctx(issi, la, "MM unknown, octets[0..%u]=%s", n ? (n - 1) : 0, dump);
         }
 
         return (int)len;
     }
-
-    case TMLE_PDISC_CMCE:
-        /* TODO: add CMCE pretty logging if desired */
-        break;
-
-    case TMLE_PDISC_SNDCP:
-        /* TODO: add SNDCP pretty logging if desired */
-        break;
-
     default:
         break;
     }
 
     return (int)len;
 }
+
