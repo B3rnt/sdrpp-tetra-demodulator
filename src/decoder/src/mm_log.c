@@ -14,11 +14,11 @@
 
 /* ---------- thread-local LA (optional) ---------- */
 #if defined(_MSC_VER)
-__declspec(thread) static int g_tls_la = -1;
-#elif defined(__GNUC__)
-__thread static int g_tls_la = -1;
+  __declspec(thread) static int g_tls_la = -1;
+#elif defined(__GNUC__) || defined(__clang__)
+  static __thread int g_tls_la = -1;   /* <-- correct order for GCC/clang */
 #else
-static int g_tls_la = -1; /* fallback (not truly TLS) */
+  static int g_tls_la = -1;            /* fallback (not truly TLS) */
 #endif
 
 void mm_log_set_thread_la(int la) { g_tls_la = la; }
