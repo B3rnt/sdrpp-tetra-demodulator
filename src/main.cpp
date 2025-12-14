@@ -7,7 +7,11 @@
 #include <gui/gui.h>
 #include <signal_path/signal_path.h>
 #include <module.h>
+
 #include <fstream>
+#include <cstring>
+#include <algorithm>
+#include <memory>
 
 #include <dsp/demod/psk.h>
 #include <dsp/buffer/packer.h>
@@ -19,7 +23,7 @@
 #include <gui/widgets/file_select.h>
 #include <gui/widgets/volume_meter.h>
 
-// NEW: to read/set VFO offsets against the waterfall center frequency
+// To read/set VFO offsets against the waterfall center frequency
 #include <gui/widgets/waterfall.h>
 
 #include <utils/flog.h>
@@ -67,18 +71,24 @@ public:
             config.conf[name]["port"] = 8355;
             config.conf[name]["sending"] = false;
 
-            // NEW: per-instance VFO lock
+            // per-instance VFO lock
             config.conf[name]["lock_freq"] = false;
             config.conf[name]["lock_freq_hz"] = 0.0; // 0 = unset
+
+            // per-instance constellation toggle
+            config.conf[name]["show_constellation"] = true;
         }
         decoder_mode = config.conf[name]["mode"];
         strcpy(hostname, std::string(config.conf[name]["hostname"]).c_str());
         port = config.conf[name]["port"];
         bool startNow = config.conf[name]["sending"];
 
-        // NEW:
+        // NEW: lock state
         lock_freq = config.conf[name].value("lock_freq", false);
         lock_freq_hz = config.conf[name].value("lock_freq_hz", 0.0);
+
+        // NEW: constellation toggle
+        show_constellation = config.conf[name].value("show_constellation", true);
 
         config.release(true);
 
@@ -93,7 +103,7 @@ public:
             true
         );
 
-        //Clock recov coeffs
+        // Clock recovery coeffs
         float recov_bandwidth = CLOCK_RECOVERY_BW;
         float recov_dampningFactor = CLOCK_RECOVERY_DAMPN_F;
         float recov_denominator = (1.0f + 2.0f * recov_dampningFactor * recov_bandwidth + recov_bandwidth * recov_bandwidth);
@@ -146,9 +156,10 @@ public:
         resamp.start();
         outconv.start();
         stream.start();
+
         gui::menu.registerEntry(name, menuHandler, this, this);
 
-        // NEW: apply lock after everything is registered
+        // Apply lock after everything is registered
         applyLockedFrequency();
 
         if (startNow) {
@@ -183,7 +194,6 @@ public:
 
         enabled = true;
 
-        // NEW:
         applyLockedFrequency();
     }
 
@@ -209,13 +219,11 @@ public:
 
 private:
     // =========================
-    // NEW: VFO lock helpers
+    // VFO lock helpers
     // =========================
 
-    // Returns the current absolute frequency (Hz) of THIS instance's VFO marker
-    // using: waterfall center frequency + this VFO's centerOffset
+    // Returns current absolute frequency (Hz) of THIS instance's VFO marker
     bool getThisVFOAbsHz(double& outHz) {
-        // gui::waterfall.vfos is public in waterfall.h
         auto it = gui::waterfall.vfos.find(name);
         if (it == gui::waterfall.vfos.end()) return false;
 
@@ -223,11 +231,10 @@ private:
         if (!wfVfo) return false;
 
         const double centerHz = gui::waterfall.getCenterFrequency();
-        outHz = centerHz + wfVfo->centerOffset; // centerOffset is the actual tuned line
+        outHz = centerHz + wfVfo->centerOffset;
         return true;
     }
 
-    // Apply stored lock_freq_hz by adjusting this VFO's centerOffset
     void applyLockedFrequency() {
         if (!lock_freq) return;
         if (!(lock_freq_hz > 0.0)) return;
@@ -240,8 +247,6 @@ private:
 
         const double centerHz = gui::waterfall.getCenterFrequency();
         const double neededOffset = lock_freq_hz - centerHz;
-
-        // Keep this instance locked even if user moves center frequency
         wfVfo->setCenterOffset(neededOffset);
     }
 
@@ -260,16 +265,25 @@ private:
 
     void setMode() {
         if (decoder_mode == 0) {
-            //osmo-tetra
+            // osmo-tetra
             demodSink.stop();
             osmotetradecoder.start();
         } else {
-            //network syms
+            // network syms
             osmotetradecoder.stop();
             demodSink.start();
         }
         config.acquire();
         config.conf[name]["mode"] = decoder_mode;
+        config.release(true);
+    }
+
+    // write lock + ui settings
+    void configWriteUI() {
+        config.acquire();
+        config.conf[name]["lock_freq"] = lock_freq;
+        config.conf[name]["lock_freq_hz"] = lock_freq_hz;
+        config.conf[name]["show_constellation"] = show_constellation;
         config.release(true);
     }
 
@@ -282,13 +296,12 @@ private:
         }
 
         // =========================
-        // NEW: per-instance frequency lock UI
+        // Frequency lock UI
         // =========================
         ImGui::Separator();
-		ImGui::TextUnformatted("Frequency (per instance)");
-		ImGui::Separator();
+        ImGui::TextUnformatted("Frequency (per instance)");
+        ImGui::Separator();
 
-        // Show current VFO frequency
         double curHz = 0.0;
         if (_this->getThisVFOAbsHz(curHz)) {
             ImGui::Text("Current VFO: %.6f MHz", curHz / 1e6);
@@ -299,34 +312,31 @@ private:
         bool lf = _this->lock_freq;
         if (ImGui::Checkbox(CONCAT("Lock##_", _this->name), &lf)) {
             _this->lock_freq = lf;
-            _this->configWriteLock();
+            _this->configWriteUI();
             _this->applyLockedFrequency();
         }
 
-        // Input frequency in MHz
         double mhz = _this->lock_freq_hz > 0.0 ? (_this->lock_freq_hz / 1e6) : 0.0;
         ImGui::SetNextItemWidth(menuWidth);
         if (ImGui::InputDouble(CONCAT("Tune (MHz)##_", _this->name), &mhz, 0.0125, 0.1, "%.6f")) {
             if (mhz > 0.0) {
                 _this->lock_freq_hz = mhz * 1e6;
-                _this->configWriteLock();
+                _this->configWriteUI();
                 _this->applyLockedFrequency();
             }
         }
         ImGui::TextDisabled("Example: 392.312500 MHz");
 
-        // Button: take the CURRENT marker frequency and lock it
         if (ImGui::Button(CONCAT("Lock to current VFO freq##_", _this->name), ImVec2(menuWidth, 0))) {
             double hz = 0.0;
             if (_this->getThisVFOAbsHz(hz)) {
                 _this->lock_freq_hz = hz;
                 _this->lock_freq = true;
-                _this->configWriteLock();
+                _this->configWriteUI();
                 _this->applyLockedFrequency();
             }
         }
 
-        // If locked, keep applying each frame (so it stays locked if center moves)
         if (_this->lock_freq) {
             _this->applyLockedFrequency();
         }
@@ -334,12 +344,21 @@ private:
         ImGui::Separator();
 
         // =========================
-        // Existing UI
+        // Constellation toggle (CPU saver)
         // =========================
+        bool sc = _this->show_constellation;
+        if (ImGui::Checkbox(CONCAT("Show constellation##_", _this->name), &sc)) {
+            _this->show_constellation = sc;
+            _this->configWriteUI();
+        }
 
-        ImGui::Text("Signal constellation: ");
-        ImGui::SetNextItemWidth(menuWidth);
-        _this->constDiag.draw();
+        if (_this->show_constellation) {
+            ImGui::Text("Signal constellation: ");
+            ImGui::SetNextItemWidth(menuWidth);
+            _this->constDiag.draw();
+        } else {
+            ImGui::TextDisabled("Signal constellation: (disabled)");
+        }
 
         float avg = 1.0f - _this->symbolExtractor.standarderr;
         ImGui::Text("Signal quality: ");
@@ -352,36 +371,201 @@ private:
         ImGui::BeginGroup();
         ImGui::Columns(2, CONCAT("TetraModeColumns##_", _this->name), false);
         if (ImGui::RadioButton(CONCAT("OSMO-TETRA##_", _this->name), _this->decoder_mode == 0) && _this->decoder_mode != 0) {
-            _this->decoder_mode = 0; //osmo-tetra
+            _this->decoder_mode = 0;
             _this->setMode();
         }
         ImGui::NextColumn();
         if (ImGui::RadioButton(CONCAT("NETSYMS##_", _this->name), _this->decoder_mode == 1) && _this->decoder_mode != 1) {
-            _this->decoder_mode = 1; //network symbol streaming
+            _this->decoder_mode = 1;
             _this->setMode();
         }
         ImGui::Columns(1, CONCAT("EndTetraModeColumns##_", _this->name), false);
         ImGui::EndGroup();
 
-        // (rest of your menuHandler stays unchanged...)
-        // ---- SNIP ----
-        // Keep your existing OSMO/NETSYMS UI here exactly as you had it.
+        if (_this->decoder_mode == 0) {
+            // =========================
+            // OSMO-TETRA UI
+            // =========================
+            int dec_st = _this->osmotetradecoder.getRxState();
+            ImGui::BoxIndicator(ImGui::GetFontSize() * 2,
+                (dec_st == 0) ? IM_COL32(230, 5, 5, 255) :
+                ((dec_st == 2) ? IM_COL32(5, 230, 5, 255) : IM_COL32(230, 230, 5, 255)));
+            ImGui::SameLine();
+            ImGui::Text(" Decoder:  %s", (dec_st == 0) ? "Unlocked" : ((dec_st == 2) ? "Locked" : "Know next start"));
+            if (dec_st != 2) {
+                style::beginDisabled();
+            }
+
+            ImGui::Text("Hyperframe: "); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%05d", _this->osmotetradecoder.getCurrHyperframe()); ImGui::SameLine();
+            ImGui::Text(" | Multiframe: "); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%02d", _this->osmotetradecoder.getCurrMultiframe()); ImGui::SameLine();
+            ImGui::Text("| Frame: "); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%02d", _this->osmotetradecoder.getCurrFrame());
+
+            ImGui::Text("Timeslots: ");
+            for (int i = 0; i < 4; i++) {
+                switch (_this->osmotetradecoder.getTimeslotContent(i)) {
+                case 0: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.8, 0.8, 0.8, 1.0), "   UL  "); break;
+                case 1: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.95, 0.05, 0.95, 1.0), " DATA  "); break;
+                case 2: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "  NDB  "); break;
+                case 3: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.05, 0.95, 0.95, 1.0), " SYNC  "); break;
+                case 4: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.05, 0.95, 0.05, 1.0), " VOICE "); break;
+                }
+            }
+
+            int crc_failed = _this->osmotetradecoder.getLastCrcFail();
+            if (crc_failed) {
+                ImGui::BoxIndicator(ImGui::GetFontSize() * 2, IM_COL32(230, 5, 5, 255));
+                ImGui::SameLine();
+                ImGui::Text(" CRC: "); ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.95, 0.05, 0.05, 1.0), "FAIL");
+                style::beginDisabled();
+            } else {
+                ImGui::BoxIndicator(ImGui::GetFontSize() * 2, IM_COL32(5, 230, 5, 255));
+                ImGui::SameLine();
+                ImGui::Text(" CRC: "); ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.05, 0.95, 0.05, 1.0), "PASS");
+            }
+
+            int dl_usg = _this->osmotetradecoder.getDlUsage();
+            int ul_usg = _this->osmotetradecoder.getUlUsage();
+
+            ImGui::Text("DL:"); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%7.3f", ((float)_this->osmotetradecoder.getDlFreq() / 1000000.0f)); ImGui::SameLine();
+            ImGui::Text(" MHz "); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0),
+                (dl_usg == 0 ? "Unalloc" :
+                 dl_usg == 1 ? "Assigned ctl" :
+                 dl_usg == 2 ? "Common ctl" :
+                 dl_usg == 3 ? "Reserved" : "Traffic"));
+
+            ImGui::Text("UL:"); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%7.3f", ((float)_this->osmotetradecoder.getUlFreq() / 1000000.0f)); ImGui::SameLine();
+            ImGui::Text(" MHz "); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), (ul_usg == 0 ? "Unalloc" : "Traffic"));
+
+            ImGui::Text("Access1: "); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%c", _this->osmotetradecoder.getAccess1Code()); ImGui::SameLine();
+            ImGui::Text("/"); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%d", _this->osmotetradecoder.getAccess1()); ImGui::SameLine();
+            ImGui::Text("| Access2: "); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%c", _this->osmotetradecoder.getAccess2Code()); ImGui::SameLine();
+            ImGui::Text("/"); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%d", _this->osmotetradecoder.getAccess2());
+
+            ImGui::Text("MCC: "); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%03d", _this->osmotetradecoder.getMcc()); ImGui::SameLine();
+            ImGui::Text("| MNC: "); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%03d", _this->osmotetradecoder.getMnc()); ImGui::SameLine();
+            ImGui::Text("| CC: "); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "0x%02x", _this->osmotetradecoder.getCc());
+
+            // NEW: LA (requires getLA() in osmotetra_dec.h)
+            ImGui::Text("LA: "); ImGui::SameLine();
+            int la = _this->osmotetradecoder.getLA();
+            if (la >= 0) {
+                ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%d", la);
+            } else {
+                ImGui::TextDisabled("unknown");
+            }
+
+            // NEW: DATA/VOICE summary
+            bool hasData = false;
+            bool hasVoice = false;
+            for (int i = 0; i < 4; i++) {
+                int tc = _this->osmotetradecoder.getTimeslotContent(i);
+                if (tc == 1) hasData = true;
+                if (tc == 4) hasVoice = true;
+            }
+            ImGui::Text("TS: "); ImGui::SameLine();
+            if (hasData) {
+                ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "DATA");
+            } else if (hasVoice) {
+                ImGui::TextColored(ImVec4(0.05, 0.95, 0.05, 1.0), "VOICE");
+            } else {
+                ImGui::TextDisabled("unknown");
+            }
+
+            ImVec4 on_color = ImVec4(0.05, 0.95, 0.05, 1.0);
+            ImVec4 off_color = ImVec4(0.95, 0.05, 0.05, 1.0);
+            ImGui::TextColored(_this->osmotetradecoder.getAdvancedLink() ? on_color : off_color, "Adv. link  "); ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getAirEncryption() ? on_color : off_color, "Encryption  "); ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getSndcpData() ? on_color : off_color, "SNDCP");
+            ImGui::TextColored(_this->osmotetradecoder.getCircuitData() ? on_color : off_color, "Circuit data  "); ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getVoiceService() ? on_color : off_color, "Voice  "); ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getNormalMode() ? on_color : off_color, "Normal mode");
+            ImGui::TextColored(_this->osmotetradecoder.getMigrationSupported() ? on_color : off_color, "Migration  "); ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getNeverMinimumMode() ? on_color : off_color, "Never min mode  "); ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getPriorityCell() ? on_color : off_color, "Priority cell");
+            ImGui::TextColored(_this->osmotetradecoder.getDeregMandatory() ? on_color : off_color, "Dereg req.  "); ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getRegMandatory() ? on_color : off_color, "Reg req.");
+
+            if (crc_failed) {
+                style::endDisabled();
+            }
+            if (dec_st != 2) {
+                style::endDisabled();
+            }
+
+        } else {
+            // =========================
+            // NETWORK SYM STREAMING UI
+            // =========================
+            ImGui::BoxIndicator(menuWidth, _this->tsfound ? IM_COL32(5, 230, 5, 255) : IM_COL32(230, 5, 5, 255));
+            ImGui::SameLine();
+            ImGui::Text(" Training sequences");
+
+            bool netActive = (_this->conn && _this->conn->isOpen());
+            if (netActive) { style::beginDisabled(); }
+
+            if (ImGui::InputText(CONCAT("UDP ##_tetrademod_host_", _this->name), _this->hostname, 1023)) {
+                config.acquire();
+                config.conf[_this->name]["hostname"] = _this->hostname;
+                config.release(true);
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(menuWidth - ImGui::GetCursorPosX());
+            if (ImGui::InputInt(CONCAT("##_tetrademod_port_", _this->name), &(_this->port), 0, 0)) {
+                config.acquire();
+                config.conf[_this->name]["port"] = _this->port;
+                config.release(true);
+            }
+
+            if (netActive) { style::endDisabled(); }
+
+            if (netActive && ImGui::Button(CONCAT("Net stop##_tetrademod_net_stop_", _this->name), ImVec2(menuWidth, 0))) {
+                _this->stopNetwork();
+                config.acquire();
+                config.conf[_this->name]["sending"] = false;
+                config.release(true);
+            } else if (!netActive && ImGui::Button(CONCAT("Net start##_tetrademod_net_stop_", _this->name), ImVec2(menuWidth, 0))) {
+                _this->startNetwork();
+                config.acquire();
+                config.conf[_this->name]["sending"] = true;
+                config.release(true);
+            }
+
+            ImGui::TextUnformatted("Net status:");
+            ImGui::SameLine();
+            if (netActive) {
+                ImGui::TextColored(ImVec4(0.0, 1.0, 0.0, 1.0), "Sending");
+            } else {
+                ImGui::TextUnformatted("Idle");
+            }
+        }
 
         if (!_this->enabled) {
             style::endDisabled();
         }
     }
 
-    // NEW helper: write lock settings
-    void configWriteLock() {
-        config.acquire();
-        config.conf[name]["lock_freq"] = lock_freq;
-        config.conf[name]["lock_freq_hz"] = lock_freq_hz;
-        config.release(true);
-    }
-
     static void _constDiagSinkHandler(dsp::complex_t* data, int count, void* ctx) {
         TetraDemodulatorModule* _this = (TetraDemodulatorModule*)ctx;
+
+        // If constellation disabled, do not copy buffers (saves CPU)
+        if (!_this->show_constellation) return;
+
         dsp::complex_t* cdBuff = _this->constDiag.acquireBuffer();
         if (count == 1024) {
             memcpy(cdBuff, data, count * sizeof(dsp::complex_t));
@@ -399,6 +583,7 @@ private:
                 _this->tsfind_buffer[i] = _this->tsfind_buffer[i + 1];
             }
             _this->tsfind_buffer[44] = data[j];
+
             if (!memcmp(_this->tsfind_buffer, training_seq_n, sizeof(training_seq_n)) ||
                 !memcmp(_this->tsfind_buffer, training_seq_p, sizeof(training_seq_p)) ||
                 !memcmp(_this->tsfind_buffer, training_seq_q, sizeof(training_seq_q)) ||
@@ -407,10 +592,11 @@ private:
                 !memcmp(_this->tsfind_buffer, training_seq_x, sizeof(training_seq_x)) ||
                 !memcmp(_this->tsfind_buffer, training_seq_X, sizeof(training_seq_X)) ||
                 !memcmp(_this->tsfind_buffer, training_seq_y, sizeof(training_seq_y))
-            ) {
+                ) {
                 _this->tsfound = true;
                 _this->symsbeforeexpire = 2048;
             }
+
             if (_this->symsbeforeexpire > 0) {
                 _this->symsbeforeexpire--;
                 if (_this->symsbeforeexpire == 0) {
@@ -446,7 +632,6 @@ private:
     dsp::BitUnpacker bitsUnpacker;
 
     dsp::sink::Handler<uint8_t> demodSink;
-
     dsp::osmotetradec osmotetradecoder;
 
     EventHandler<float> srChangeHandler;
@@ -457,18 +642,23 @@ private:
 
     int decoder_mode = 0;
 
-    // NEW: lock state
+    // Lock state
     bool lock_freq = false;
     double lock_freq_hz = 0.0;
 
-    //Sequences from osmo-tetra-sq5bpf source
+    // Constellation toggle
+    bool show_constellation = true;
+
+    // Sequences
     static const constexpr uint8_t training_seq_n[22] = { 1,1, 0,1, 0,0, 0,0, 1,1, 1,0, 1,0, 0,1, 1,1, 0,1, 0,0 };
     static const constexpr uint8_t training_seq_p[22] = { 0,1, 1,1, 1,0, 1,0, 0,1, 0,0, 0,0, 1,1, 0,1, 1,1, 1,0 };
     static const constexpr uint8_t training_seq_q[22] = { 1,0, 1,1, 0,1, 1,1, 0,0, 0,0, 0,1, 1,0, 1,0, 1,1, 0,1 };
     static const constexpr uint8_t training_seq_N[33] = { 1,1,1, 0,0,1, 1,0,1, 1,1,1, 0,0,0, 1,1,1, 1,0,0, 0,1,1, 1,1,0, 0,0,0, 0,0,0 };
     static const constexpr uint8_t training_seq_P[33] = { 1,0,1, 0,1,1, 1,1,1, 1,0,1, 0,1,0, 1,0,1, 1,1,0, 0,0,1, 1,0,0, 0,1,0, 0,1,0 };
+
     static const constexpr uint8_t training_seq_x[30] = { 1,0, 0,1, 1,1, 0,1, 0,0, 0,0, 1,1, 1,0, 1,0, 0,1, 1,1, 0,1, 0,0, 0,0, 1,1 };
     static const constexpr uint8_t training_seq_X[45] = { 0,1,1,1,0,0,1,1,0,1,0,0,0,0,1,0,0,0,1,1,1,0,1,1,0,1,0,1,0,1,1,1,1,1,0,1,0,0,0,0,0,1,1,1,0 };
+
     static const constexpr uint8_t training_seq_y[38] = { 1,1, 0,0, 0,0, 0,1, 1,0, 0,1, 1,1, 0,0, 1,1, 1,0, 1,0, 0,1, 1,1, 0,0, 0,0, 0,1, 1,0, 0,1, 1,1 };
 
     uint8_t tsfind_buffer[45];
