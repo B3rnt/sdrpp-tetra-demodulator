@@ -150,7 +150,7 @@ static void mm_try_pretty_log(uint32_t issi, uint32_t la, const uint8_t *mm_bits
     /* Fallback */
     mm_logf_ctx(issi, la, "MM type=0x%X (unparsed) len=%u bits", pdu_type, mm_len_bits);
 
-out:
+out: ; /* MSVC: a label must precede a statement (empty statement is fine) */
 #undef HAVE
 #undef GET
 #undef ADV
