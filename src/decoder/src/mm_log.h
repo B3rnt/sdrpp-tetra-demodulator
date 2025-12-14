@@ -14,3 +14,9 @@ void mm_logf_ctx(uint32_t issi, int la, const char *fmt, ...);
 #ifdef __cplusplus
 }
 #endif
+
+/* Backward compatibility:
+ * oudere code gebruikt mm_logf_with_ctx / mm_log_with_ctx
+ */
+#define mm_log_with_ctx  mm_log_ctx
+#define mm_logf_with_ctx mm_logf_ctx
