@@ -66,7 +66,9 @@ namespace dsp {
             double _omegaGain;
             double _muGain;
             double _omegaRelLimit;
-            int _interpPhaseCount;
+            
+            bool _didInitScan = false;
+int _interpPhaseCount;
             int _interpTapCount;
 
             int offset = 0;

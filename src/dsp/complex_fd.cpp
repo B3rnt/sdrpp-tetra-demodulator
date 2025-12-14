@@ -37,6 +37,7 @@ namespace dsp {
             pcl.phase = 0.0f;
             _spsctr = 0;
             pcl.freq = _omega;
+            _didInitScan = false;
             pcl.setFreqLimits(_omega * (1.0 - _omegaRelLimit), _omega * (1.0 + _omegaRelLimit));
             base_type::tempStart();
         }
@@ -84,6 +85,7 @@ namespace dsp {
             pcl.phase = 0.0f;
             _spsctr = 0;
             pcl.freq = _omega;
+            _didInitScan = false;
             base_type::tempStart();
         }
 
@@ -92,6 +94,63 @@ namespace dsp {
             memcpy(bufStart, in, count * sizeof(complex_t));
 
             // Process all samples
+
+            /* Initial timing phase scan (mu scan):
+             * Try a small set of fractional phases and pick the one with the most stable timing error.
+             * This noticeably improves burst detection / decode rate on weaker signals. */
+            if (!_didInitScan && count > (_interpTapCount + 64)) {
+                const int CANDS = 8;
+                float bestScore = 1e30f;
+                float bestPhase = pcl.phase;
+                int testSymbols = 48; /* keep cheap */
+                for (int k = 0; k < CANDS; k++) {
+                    float candPhase = (k + 0.5f) / (float)CANDS; /* 0..1 */
+                    float score = 0.0f;
+                    float tp = candPhase;
+                    int toff = 0;
+                    int symCount = 0;
+                    int spsctr = 0;
+                    while (toff < count && symCount < testSymbols) {
+                        int phase = std::clamp<int>(floorf(tp * (float)_interpPhaseCount), 0, _interpPhaseCount - 1);
+                        complex_t outVal;
+                        volk_32fc_32f_dot_prod_32fc((lv_32fc_t*)&outVal, (lv_32fc_t*)&buffer[toff], interpBank.phases[phase], _interpTapCount);
+                        if (spsctr == 0) {
+                            complex_t dfdt;
+                            if (phase == 0) {
+                                complex_t fT1;
+                                volk_32fc_32f_dot_prod_32fc((lv_32fc_t*)&fT1, (lv_32fc_t*)&buffer[toff], interpBank.phases[phase+1], _interpTapCount);
+                                dfdt = fT1 - outVal;
+                            } else if (phase == _interpPhaseCount - 1) {
+                                complex_t fT_1;
+                                volk_32fc_32f_dot_prod_32fc((lv_32fc_t*)&fT_1, (lv_32fc_t*)&buffer[toff], interpBank.phases[phase-1], _interpTapCount);
+                                dfdt = outVal - fT_1;
+                            } else {
+                                complex_t fT_1, fT1;
+                                volk_32fc_32f_dot_prod_32fc((lv_32fc_t*)&fT1, (lv_32fc_t*)&buffer[toff], interpBank.phases[phase+1], _interpTapCount);
+                                volk_32fc_32f_dot_prod_32fc((lv_32fc_t*)&fT_1, (lv_32fc_t*)&buffer[toff], interpBank.phases[phase-1], _interpTapCount);
+                                dfdt = (fT1 - fT_1) * 0.5f;
+                            }
+                            float err = (((outVal.re > 0 ? 1.0f : -1.0f) * dfdt.re) + ((outVal.im > 0 ? 1.0f : -1.0f) * dfdt.im));
+                            float a = outVal.fastAmplitude();
+                            if (a < 1.0f) err *= a;
+                            score += fabsf(err);
+                            symCount++;
+                        }
+                        spsctr++;
+                        if (spsctr >= _outSps) spsctr = 0;
+                        /* advance by nominal omega */
+                        tp += (float)_omega;
+                        float delta = floorf(tp);
+                        toff += (int)delta;
+                        tp -= delta;
+                    }
+                    if (symCount > 0) score /= (float)symCount;
+                    if (score < bestScore) { bestScore = score; bestPhase = candPhase; }
+                }
+                pcl.phase = bestPhase;
+                _didInitScan = true;
+            }
+
             int outCount = 0;
             while (offset < count) {
                 float error;
