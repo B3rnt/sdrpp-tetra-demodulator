@@ -12,6 +12,10 @@
 
 #define MM_BROADCAST_ISSI 0xFFFFFFu
 
+/* ---------------------------------------
+   Cross-platform append write (1 OS write)
+   --------------------------------------- */
+
 #if defined(_WIN32)
   #include <io.h>
   #include <fcntl.h>
@@ -20,6 +24,7 @@
   {
       int fd = _open(MM_LOG_PATH, _O_WRONLY | _O_CREAT | _O_APPEND, _S_IREAD | _S_IWRITE);
       if (fd < 0) return 0;
+
       const char *p = data;
       while (len > 0) {
           int n = _write(fd, p, (unsigned)len);
@@ -38,6 +43,7 @@
   {
       int fd = open(MM_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
       if (fd < 0) return 0;
+
       const char *p = data;
       while (len > 0) {
           ssize_t n = write(fd, p, len);
@@ -64,42 +70,19 @@ static void make_timestamp(char out[32])
              tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
 }
 
-/* Parse ISSI from text lines like "ISSI=3360454 ..." */
-static int parse_issi_from_line(const char *line, uint32_t *out_issi)
-{
-    if (!line) return 0;
-    const char *p = strstr(line, "ISSI=");
-    if (!p) return 0;
-    p += 5;
-
-    uint32_t v = 0;
-    int digits = 0;
-    while (*p >= '0' && *p <= '9') {
-        v = (v * 10u) + (uint32_t)(*p - '0');
-        p++;
-        digits++;
-        if (digits > 10) break;
-    }
-    if (digits == 0) return 0;
-
-    *out_issi = v & 0xFFFFFFu;
-    return 1;
-}
-
 static int should_drop_issi(uint32_t issi)
 {
     return ((issi & 0xFFFFFFu) == MM_BROADCAST_ISSI);
 }
 
-/* Writes exactly ONE line (single OS write) */
-static void write_one_line(const char *line)
+/* ---------------------------------------
+   Core writers
+   --------------------------------------- */
+
+/* Unfiltered write (used by mm_log/mm_logf) */
+static void write_one_line_unfiltered(const char *line)
 {
     if (!line || !*line) return;
-
-    /* Only keep real ISSI lines */
-    uint32_t issi = 0;
-    if (!parse_issi_from_line(line, &issi)) return;
-    if (should_drop_issi(issi)) return;
 
     char ts[32];
     make_timestamp(ts);
@@ -107,10 +90,10 @@ static void write_one_line(const char *line)
     char out[1024];
     int n = snprintf(out, sizeof(out), "[%s] %s\n", ts, line);
     if (n <= 0) return;
+
     if ((size_t)n >= sizeof(out)) {
-        /* truncate safely */
-        out[sizeof(out)-2] = '\n';
-        out[sizeof(out)-1] = '\0';
+        out[sizeof(out) - 2] = '\n';
+        out[sizeof(out) - 1] = '\0';
         append_write_all(out, strlen(out));
         return;
     }
@@ -118,19 +101,20 @@ static void write_one_line(const char *line)
     append_write_all(out, (size_t)n);
 }
 
-/* Preferred: ctx logging, no parsing, adds LA automatically */
+/* Context write (filters 0xFFFFFF; adds LA automatically) */
 static void write_one_line_ctx(uint32_t issi, int la, const char *payload)
 {
     if (!payload || !*payload) return;
 
     issi &= 0xFFFFFFu;
-    if (should_drop_issi(issi)) return;
+    if (should_drop_issi(issi)) return; /* <-- your requirement */
 
     char ts[32];
     make_timestamp(ts);
 
     char out[1024];
     int n;
+
     if (la >= 0) {
         n = snprintf(out, sizeof(out),
                      "[%s] LA=%d ISSI=%u (0x%06X) %s\n",
@@ -142,9 +126,10 @@ static void write_one_line_ctx(uint32_t issi, int la, const char *payload)
     }
 
     if (n <= 0) return;
+
     if ((size_t)n >= sizeof(out)) {
-        out[sizeof(out)-2] = '\n';
-        out[sizeof(out)-1] = '\0';
+        out[sizeof(out) - 2] = '\n';
+        out[sizeof(out) - 1] = '\0';
         append_write_all(out, strlen(out));
         return;
     }
@@ -152,9 +137,13 @@ static void write_one_line_ctx(uint32_t issi, int la, const char *payload)
     append_write_all(out, (size_t)n);
 }
 
+/* ---------------------------------------
+   Public API
+   --------------------------------------- */
+
 void mm_log(const char *line)
 {
-    write_one_line(line);
+    write_one_line_unfiltered(line);
 }
 
 void mm_logf(const char *fmt, ...)
@@ -167,7 +156,7 @@ void mm_logf(const char *fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
 
-    write_one_line(buf);
+    write_one_line_unfiltered(buf);
 }
 
 void mm_log_ctx(uint32_t issi, int la, const char *line)
@@ -186,4 +175,23 @@ void mm_logf_ctx(uint32_t issi, int la, const char *fmt, ...)
     va_end(ap);
 
     write_one_line_ctx(issi, la, buf);
+}
+
+/* Backward compatible wrappers: LA unknown (-1) */
+void mm_log_with_ctx(uint32_t issi, const char *line)
+{
+    mm_log_ctx(issi, -1, line);
+}
+
+void mm_logf_with_ctx(uint32_t issi, const char *fmt, ...)
+{
+    if (!fmt || !*fmt) return;
+
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    mm_log_ctx(issi, -1, buf);
 }
