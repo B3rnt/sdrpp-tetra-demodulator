@@ -19,9 +19,8 @@
 #include <gui/widgets/file_select.h>
 #include <gui/widgets/volume_meter.h>
 
-// NEW: access waterfall + tuner
+// NEW: to read/set VFO offsets against the waterfall center frequency
 #include <gui/widgets/waterfall.h>
-#include <tuner/tuner.h>
 
 #include <utils/flog.h>
 #include <utils/net.h>
@@ -68,19 +67,18 @@ public:
             config.conf[name]["port"] = 8355;
             config.conf[name]["sending"] = false;
 
-            // NEW: per-instance frequency lock
-            config.conf[name]["freq_lock"] = false;
-            config.conf[name]["freq_mhz"]  = 0.0;   // 0 = not set
+            // NEW: per-instance VFO lock
+            config.conf[name]["lock_freq"] = false;
+            config.conf[name]["lock_freq_hz"] = 0.0; // 0 = unset
         }
-
         decoder_mode = config.conf[name]["mode"];
         strcpy(hostname, std::string(config.conf[name]["hostname"]).c_str());
         port = config.conf[name]["port"];
         bool startNow = config.conf[name]["sending"];
 
         // NEW:
-        freq_lock = config.conf[name].value("freq_lock", false);
-        freq_mhz  = config.conf[name].value("freq_mhz", 0.0);
+        lock_freq = config.conf[name].value("lock_freq", false);
+        lock_freq_hz = config.conf[name].value("lock_freq_hz", 0.0);
 
         config.release(true);
 
@@ -98,22 +96,31 @@ public:
         //Clock recov coeffs
         float recov_bandwidth = CLOCK_RECOVERY_BW;
         float recov_dampningFactor = CLOCK_RECOVERY_DAMPN_F;
-        float recov_denominator = (1.0f + 2.0f*recov_dampningFactor*recov_bandwidth + recov_bandwidth*recov_bandwidth);
+        float recov_denominator = (1.0f + 2.0f * recov_dampningFactor * recov_bandwidth + recov_bandwidth * recov_bandwidth);
         float recov_mu = (4.0f * recov_dampningFactor * recov_bandwidth) / recov_denominator;
         float recov_omega = (4.0f * recov_bandwidth * recov_bandwidth) / recov_denominator;
 
         mainDemodulator.init(
-            vfo->output, 18000, VFO_SAMPLERATE,
-            RRC_TAP_COUNT, RRC_ALPHA, AGC_RATE,
-            COSTAS_LOOP_BANDWIDTH, FLL_LOOP_BANDWIDTH,
-            recov_omega, recov_mu, CLOCK_RECOVERY_REL_LIM
+            vfo->output,
+            18000,
+            VFO_SAMPLERATE,
+            RRC_TAP_COUNT,
+            RRC_ALPHA,
+            AGC_RATE,
+            COSTAS_LOOP_BANDWIDTH,
+            FLL_LOOP_BANDWIDTH,
+            recov_omega,
+            recov_mu,
+            CLOCK_RECOVERY_REL_LIM
         );
 
         constDiagSplitter.init(&mainDemodulator.out);
         constDiagSplitter.bindStream(&constDiagStream);
         constDiagSplitter.bindStream(&demodStream);
+
         constDiagReshaper.init(&constDiagStream, 1024, 0);
         constDiagSink.init(&constDiagReshaper.out, _constDiagSinkHandler, this);
+
         symbolExtractor.init(&demodStream);
         bitsUnpacker.init(&symbolExtractor.out);
 
@@ -141,16 +148,16 @@ public:
         stream.start();
         gui::menu.registerEntry(name, menuHandler, this, this);
 
-        // NEW: apply lock on startup
+        // NEW: apply lock after everything is registered
         applyLockedFrequency();
 
-        if(startNow) {
+        if (startNow) {
             startNetwork();
         }
     }
 
     ~TetraDemodulatorModule() {
-        if(isEnabled()) {
+        if (isEnabled()) {
             disable();
         }
         gui::menu.removeEntry(name);
@@ -176,7 +183,7 @@ public:
 
         enabled = true;
 
-        // NEW: re-apply lock when enabling
+        // NEW:
         applyLockedFrequency();
     }
 
@@ -201,38 +208,41 @@ public:
     }
 
 private:
-    // -----------------------
-    // NEW: helpers for "pick on screen" + lock
-    // -----------------------
+    // =========================
+    // NEW: VFO lock helpers
+    // =========================
 
-    // Get this instance's CURRENT displayed frequency from the waterfall (Hz).
-    // This uses: centerFrequency + vfo.generalOffset. Waterfall keeps those. :contentReference[oaicite:1]{index=1}
-    bool getCurrentVfoFreqHz(double &outHz) {
+    // Returns the current absolute frequency (Hz) of THIS instance's VFO marker
+    // using: waterfall center frequency + this VFO's centerOffset
+    bool getThisVFOAbsHz(double& outHz) {
+        // gui::waterfall.vfos is public in waterfall.h
         auto it = gui::waterfall.vfos.find(name);
-        if (it == gui::waterfall.vfos.end() || it->second == nullptr) return false;
+        if (it == gui::waterfall.vfos.end()) return false;
+
+        ImGui::WaterfallVFO* wfVfo = it->second;
+        if (!wfVfo) return false;
 
         const double centerHz = gui::waterfall.getCenterFrequency();
-        const double offsetHz = it->second->generalOffset;
-        outHz = centerHz + offsetHz;
+        outHz = centerHz + wfVfo->centerOffset; // centerOffset is the actual tuned line
         return true;
     }
 
-    // Tune this instance VFO to an absolute frequency (MHz) using tuner API.
-    void tuneToMHz(double mhz) {
-        if (!(mhz > 0.0)) return;
-        const double hz = mhz * 1e6;
-
-        try {
-            tuner::tune(tuner::TUNER_MODE_NORMAL, name, hz);
-        } catch (...) {
-            flog::error("TETRA: tune failed for %s to %.6f MHz\n", name.c_str(), mhz);
-        }
-    }
-
+    // Apply stored lock_freq_hz by adjusting this VFO's centerOffset
     void applyLockedFrequency() {
-        if (!freq_lock) return;
-        if (!(freq_mhz > 0.0)) return;
-        tuneToMHz(freq_mhz);
+        if (!lock_freq) return;
+        if (!(lock_freq_hz > 0.0)) return;
+
+        auto it = gui::waterfall.vfos.find(name);
+        if (it == gui::waterfall.vfos.end()) return;
+
+        ImGui::WaterfallVFO* wfVfo = it->second;
+        if (!wfVfo) return;
+
+        const double centerHz = gui::waterfall.getCenterFrequency();
+        const double neededOffset = lock_freq_hz - centerHz;
+
+        // Keep this instance locked even if user moves center frequency
+        wfVfo->setCenterOffset(neededOffset);
     }
 
     void startNetwork() {
@@ -249,7 +259,7 @@ private:
     }
 
     void setMode() {
-        if(decoder_mode == 0) {
+        if (decoder_mode == 0) {
             //osmo-tetra
             demodSink.stop();
             osmotetradecoder.start();
@@ -267,70 +277,64 @@ private:
         TetraDemodulatorModule* _this = (TetraDemodulatorModule*)ctx;
         float menuWidth = ImGui::GetContentRegionAvail().x;
 
-        if(!_this->enabled) {
+        if (!_this->enabled) {
             style::beginDisabled();
         }
 
         // =========================
-        // NEW: Frequency select + lock (per plugin instance)
+        // NEW: per-instance frequency lock UI
         // =========================
         ImGui::SeparatorText("Frequency (per instance)");
 
-        // Show current VFO frequency (from screen)
+        // Show current VFO frequency
         double curHz = 0.0;
-        if (_this->getCurrentVfoFreqHz(curHz)) {
+        if (_this->getThisVFOAbsHz(curHz)) {
             ImGui::Text("Current VFO: %.6f MHz", curHz / 1e6);
         } else {
-            ImGui::TextDisabled("Current VFO: (unavailable)");
+            ImGui::TextDisabled("Current VFO: (not available)");
         }
 
-        // Button: copy current VFO freq into freq_mhz
-        if (ImGui::Button(CONCAT("Use current VFO freq##_", _this->name), ImVec2(menuWidth, 0))) {
-            double hz = 0.0;
-            if (_this->getCurrentVfoFreqHz(hz)) {
-                _this->freq_mhz = hz / 1e6;
-
-                config.acquire();
-                config.conf[_this->name]["freq_mhz"] = _this->freq_mhz;
-                config.release(true);
-
-                if (_this->freq_lock) {
-                    _this->tuneToMHz(_this->freq_mhz);
-                }
-            }
+        bool lf = _this->lock_freq;
+        if (ImGui::Checkbox(CONCAT("Lock##_", _this->name), &lf)) {
+            _this->lock_freq = lf;
+            _this->configWriteLock();
+            _this->applyLockedFrequency();
         }
 
-        // Manual input
-        double mhz = _this->freq_mhz;
+        // Input frequency in MHz
+        double mhz = _this->lock_freq_hz > 0.0 ? (_this->lock_freq_hz / 1e6) : 0.0;
         ImGui::SetNextItemWidth(menuWidth);
         if (ImGui::InputDouble(CONCAT("Tune (MHz)##_", _this->name), &mhz, 0.0125, 0.1, "%.6f")) {
-            _this->freq_mhz = mhz;
-
-            config.acquire();
-            config.conf[_this->name]["freq_mhz"] = _this->freq_mhz;
-            config.release(true);
-
-            if (_this->freq_lock) {
-                _this->tuneToMHz(_this->freq_mhz);
+            if (mhz > 0.0) {
+                _this->lock_freq_hz = mhz * 1e6;
+                _this->configWriteLock();
+                _this->applyLockedFrequency();
             }
         }
-        ImGui::TextDisabled("Example: 392.312500 = 392,312,500 Hz");
+        ImGui::TextDisabled("Example: 392.312500 MHz");
 
-        // Lock checkbox
-        bool lock = _this->freq_lock;
-        if (ImGui::Checkbox(CONCAT("Lock##_", _this->name), &lock)) {
-            _this->freq_lock = lock;
+        // Button: take the CURRENT marker frequency and lock it
+        if (ImGui::Button(CONCAT("Lock to current VFO freq##_", _this->name), ImVec2(menuWidth, 0))) {
+            double hz = 0.0;
+            if (_this->getThisVFOAbsHz(hz)) {
+                _this->lock_freq_hz = hz;
+                _this->lock_freq = true;
+                _this->configWriteLock();
+                _this->applyLockedFrequency();
+            }
+        }
 
-            config.acquire();
-            config.conf[_this->name]["freq_lock"] = _this->freq_lock;
-            config.release(true);
-
+        // If locked, keep applying each frame (so it stays locked if center moves)
+        if (_this->lock_freq) {
             _this->applyLockedFrequency();
         }
 
         ImGui::Separator();
 
-        // ===== existing UI =====
+        // =========================
+        // Existing UI
+        // =========================
+
         ImGui::Text("Signal constellation: ");
         ImGui::SetNextItemWidth(menuWidth);
         _this->constDiag.draw();
@@ -339,7 +343,7 @@ private:
         ImGui::Text("Signal quality: ");
         ImGui::SameLine();
         ImGui::SigQualityMeter(avg, 0.5f, 1.0f);
-        ImGui::BoxIndicator(ImGui::GetFontSize()*2, _this->symbolExtractor.sync ? IM_COL32(5, 230, 5, 255) : IM_COL32(230, 5, 5, 255));
+        ImGui::BoxIndicator(ImGui::GetFontSize() * 2, _this->symbolExtractor.sync ? IM_COL32(5, 230, 5, 255) : IM_COL32(230, 5, 5, 255));
         ImGui::SameLine();
         ImGui::Text(" Sync");
 
@@ -357,19 +361,27 @@ private:
         ImGui::Columns(1, CONCAT("EndTetraModeColumns##_", _this->name), false);
         ImGui::EndGroup();
 
-        // (rest of your existing menuHandler stays exactly the same...)
-        // --- SNIP ---
-        // Keep the rest of your long OSMO/NETSYMS UI unchanged.
+        // (rest of your menuHandler stays unchanged...)
+        // ---- SNIP ----
+        // Keep your existing OSMO/NETSYMS UI here exactly as you had it.
 
-        if(!_this->enabled) {
+        if (!_this->enabled) {
             style::endDisabled();
         }
+    }
+
+    // NEW helper: write lock settings
+    void configWriteLock() {
+        config.acquire();
+        config.conf[name]["lock_freq"] = lock_freq;
+        config.conf[name]["lock_freq_hz"] = lock_freq_hz;
+        config.release(true);
     }
 
     static void _constDiagSinkHandler(dsp::complex_t* data, int count, void* ctx) {
         TetraDemodulatorModule* _this = (TetraDemodulatorModule*)ctx;
         dsp::complex_t* cdBuff = _this->constDiag.acquireBuffer();
-        if(count == 1024) {
+        if (count == 1024) {
             memcpy(cdBuff, data, count * sizeof(dsp::complex_t));
         }
         _this->constDiag.releaseBuffer();
@@ -377,15 +389,15 @@ private:
 
     static void _demodSinkHandler(uint8_t* data, int count, void* ctx) {
         TetraDemodulatorModule* _this = (TetraDemodulatorModule*)ctx;
-        if(_this->conn && _this->conn->isOpen()) {
+        if (_this->conn && _this->conn->isOpen()) {
             _this->conn->send(data, count);
         }
-        for(int j = 0; j < count; j++) {
-            for(int i = 0; i < 44; i++) {
-                _this->tsfind_buffer[i] = _this->tsfind_buffer[i+1];
+        for (int j = 0; j < count; j++) {
+            for (int i = 0; i < 44; i++) {
+                _this->tsfind_buffer[i] = _this->tsfind_buffer[i + 1];
             }
             _this->tsfind_buffer[44] = data[j];
-            if(!memcmp(_this->tsfind_buffer, training_seq_n, sizeof(training_seq_n)) ||
+            if (!memcmp(_this->tsfind_buffer, training_seq_n, sizeof(training_seq_n)) ||
                 !memcmp(_this->tsfind_buffer, training_seq_p, sizeof(training_seq_p)) ||
                 !memcmp(_this->tsfind_buffer, training_seq_q, sizeof(training_seq_q)) ||
                 !memcmp(_this->tsfind_buffer, training_seq_N, sizeof(training_seq_N)) ||
@@ -397,9 +409,9 @@ private:
                 _this->tsfound = true;
                 _this->symsbeforeexpire = 2048;
             }
-            if(_this->symsbeforeexpire > 0) {
+            if (_this->symsbeforeexpire > 0) {
                 _this->symsbeforeexpire--;
-                if(_this->symsbeforeexpire == 0) {
+                if (_this->symsbeforeexpire == 0) {
                     _this->tsfound = false;
                 }
             }
@@ -443,9 +455,9 @@ private:
 
     int decoder_mode = 0;
 
-    // NEW: per-instance freq lock state
-    bool freq_lock = false;
-    double freq_mhz = 0.0;
+    // NEW: lock state
+    bool lock_freq = false;
+    double lock_freq_hz = 0.0;
 
     //Sequences from osmo-tetra-sq5bpf source
     static const constexpr uint8_t training_seq_n[22] = { 1,1, 0,1, 0,0, 0,0, 1,1, 1,0, 1,0, 0,1, 1,1, 0,1, 0,0 };
