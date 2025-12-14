@@ -368,6 +368,13 @@ private:
         ImGui::SameLine();
         ImGui::Text(" Sync");
 
+		// Forceer OSMO-TETRA, geen GUI-switch meer
+		if (_this->decoder_mode != 0) {
+			_this->decoder_mode = 0;
+			_this->setMode();
+		}
+
+
         if (_this->decoder_mode == 0) {
             // =========================
             // OSMO-TETRA UI
@@ -381,7 +388,65 @@ private:
             if (dec_st != 2) {
                 style::beginDisabled();
             }
+			if (false) {
+            ImGui::Text("Hyperframe: "); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%05d", _this->osmotetradecoder.getCurrHyperframe()); ImGui::SameLine();
+            ImGui::Text(" | Multiframe: "); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%02d", _this->osmotetradecoder.getCurrMultiframe()); ImGui::SameLine();
+            ImGui::Text("| Frame: "); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%02d", _this->osmotetradecoder.getCurrFrame());
 
+            ImGui::Text("Timeslots: ");
+            for (int i = 0; i < 4; i++) {
+                switch (_this->osmotetradecoder.getTimeslotContent(i)) {
+                case 0: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.8, 0.8, 0.8, 1.0), "   UL  "); break;
+                case 1: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.95, 0.05, 0.95, 1.0), " DATA  "); break;
+                case 2: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "  NDB  "); break;
+                case 3: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.05, 0.95, 0.95, 1.0), " SYNC  "); break;
+                case 4: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.05, 0.95, 0.05, 1.0), " VOICE "); break;
+                }
+            }
+
+            int crc_failed = _this->osmotetradecoder.getLastCrcFail();
+            if (crc_failed) {
+                ImGui::BoxIndicator(ImGui::GetFontSize() * 2, IM_COL32(230, 5, 5, 255));
+                ImGui::SameLine();
+                ImGui::Text(" CRC: "); ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.95, 0.05, 0.05, 1.0), "FAIL");
+                style::beginDisabled();
+            } else {
+                ImGui::BoxIndicator(ImGui::GetFontSize() * 2, IM_COL32(5, 230, 5, 255));
+                ImGui::SameLine();
+                ImGui::Text(" CRC: "); ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.05, 0.95, 0.05, 1.0), "PASS");
+            }
+
+            int dl_usg = _this->osmotetradecoder.getDlUsage();
+            int ul_usg = _this->osmotetradecoder.getUlUsage();
+
+            ImGui::Text("DL:"); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%7.3f", ((float)_this->osmotetradecoder.getDlFreq() / 1000000.0f)); ImGui::SameLine();
+            ImGui::Text(" MHz "); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0),
+                (dl_usg == 0 ? "Unalloc" :
+                 dl_usg == 1 ? "Assigned ctl" :
+                 dl_usg == 2 ? "Common ctl" :
+                 dl_usg == 3 ? "Reserved" : "Traffic"));
+
+            ImGui::Text("UL:"); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%7.3f", ((float)_this->osmotetradecoder.getUlFreq() / 1000000.0f)); ImGui::SameLine();
+            ImGui::Text(" MHz "); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), (ul_usg == 0 ? "Unalloc" : "Traffic"));
+
+            ImGui::Text("Access1: "); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%c", _this->osmotetradecoder.getAccess1Code()); ImGui::SameLine();
+            ImGui::Text("/"); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%d", _this->osmotetradecoder.getAccess1()); ImGui::SameLine();
+            ImGui::Text("| Access2: "); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%c", _this->osmotetradecoder.getAccess2Code()); ImGui::SameLine();
+            ImGui::Text("/"); ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%d", _this->osmotetradecoder.getAccess2());
+			}
             ImGui::Text("MCC: "); ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%03d", _this->osmotetradecoder.getMcc()); ImGui::SameLine();
             ImGui::Text("| MNC: "); ImGui::SameLine();
@@ -414,7 +479,21 @@ private:
             } else {
                 ImGui::TextDisabled("unknown");
             }
-
+			if (false) {
+            ImVec4 on_color = ImVec4(0.05, 0.95, 0.05, 1.0);
+            ImVec4 off_color = ImVec4(0.95, 0.05, 0.05, 1.0);
+            ImGui::TextColored(_this->osmotetradecoder.getAdvancedLink() ? on_color : off_color, "Adv. link  "); ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getAirEncryption() ? on_color : off_color, "Encryption  "); ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getSndcpData() ? on_color : off_color, "SNDCP");
+            ImGui::TextColored(_this->osmotetradecoder.getCircuitData() ? on_color : off_color, "Circuit data  "); ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getVoiceService() ? on_color : off_color, "Voice  "); ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getNormalMode() ? on_color : off_color, "Normal mode");
+            ImGui::TextColored(_this->osmotetradecoder.getMigrationSupported() ? on_color : off_color, "Migration  "); ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getNeverMinimumMode() ? on_color : off_color, "Never min mode  "); ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getPriorityCell() ? on_color : off_color, "Priority cell");
+            ImGui::TextColored(_this->osmotetradecoder.getDeregMandatory() ? on_color : off_color, "Dereg req.  "); ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getRegMandatory() ? on_color : off_color, "Reg req.");
+			}
             if (crc_failed) {
                 style::endDisabled();
             }
