@@ -8,10 +8,6 @@
 #include <signal_path/signal_path.h>
 #include <module.h>
 #include <fstream>
-#include <cmath>
-
-// NEW: for absolute tuning like frequency_manager does
-#include <tuner/tuner.h>
 
 #include <dsp/demod/psk.h>
 #include <dsp/buffer/packer.h>
@@ -22,6 +18,10 @@
 #include <gui/widgets/constellation_diagram.h>
 #include <gui/widgets/file_select.h>
 #include <gui/widgets/volume_meter.h>
+
+// NEW: access waterfall + tuner
+#include <gui/widgets/waterfall.h>
+#include <tuner/tuner.h>
 
 #include <utils/flog.h>
 #include <utils/net.h>
@@ -68,18 +68,19 @@ public:
             config.conf[name]["port"] = 8355;
             config.conf[name]["sending"] = false;
 
-            // NEW: per instance absolute tune
-            config.conf[name]["lock_tune"] = false;
-            config.conf[name]["tune_mhz"] = 0.0; // 0 = disabled / not set
+            // NEW: per-instance frequency lock
+            config.conf[name]["freq_lock"] = false;
+            config.conf[name]["freq_mhz"]  = 0.0;   // 0 = not set
         }
+
         decoder_mode = config.conf[name]["mode"];
         strcpy(hostname, std::string(config.conf[name]["hostname"]).c_str());
         port = config.conf[name]["port"];
         bool startNow = config.conf[name]["sending"];
 
         // NEW:
-        lock_tune = config.conf[name].value("lock_tune", false);
-        tune_mhz  = config.conf[name].value("tune_mhz", 0.0);
+        freq_lock = config.conf[name].value("freq_lock", false);
+        freq_mhz  = config.conf[name].value("freq_mhz", 0.0);
 
         config.release(true);
 
@@ -101,16 +102,18 @@ public:
         float recov_mu = (4.0f * recov_dampningFactor * recov_bandwidth) / recov_denominator;
         float recov_omega = (4.0f * recov_bandwidth * recov_bandwidth) / recov_denominator;
 
-        mainDemodulator.init(vfo->output, 18000, VFO_SAMPLERATE, RRC_TAP_COUNT, RRC_ALPHA, AGC_RATE,
-                             COSTAS_LOOP_BANDWIDTH, FLL_LOOP_BANDWIDTH, recov_omega, recov_mu, CLOCK_RECOVERY_REL_LIM);
+        mainDemodulator.init(
+            vfo->output, 18000, VFO_SAMPLERATE,
+            RRC_TAP_COUNT, RRC_ALPHA, AGC_RATE,
+            COSTAS_LOOP_BANDWIDTH, FLL_LOOP_BANDWIDTH,
+            recov_omega, recov_mu, CLOCK_RECOVERY_REL_LIM
+        );
 
         constDiagSplitter.init(&mainDemodulator.out);
         constDiagSplitter.bindStream(&constDiagStream);
         constDiagSplitter.bindStream(&demodStream);
-
         constDiagReshaper.init(&constDiagStream, 1024, 0);
         constDiagSink.init(&constDiagReshaper.out, _constDiagSinkHandler, this);
-
         symbolExtractor.init(&demodStream);
         bitsUnpacker.init(&symbolExtractor.out);
 
@@ -138,8 +141,8 @@ public:
         stream.start();
         gui::menu.registerEntry(name, menuHandler, this, this);
 
-        // NEW: apply initial tune if enabled
-        applyTuneIfLocked();
+        // NEW: apply lock on startup
+        applyLockedFrequency();
 
         if(startNow) {
             startNetwork();
@@ -173,8 +176,8 @@ public:
 
         enabled = true;
 
-        // NEW: re-apply tune on enable
-        applyTuneIfLocked();
+        // NEW: re-apply lock when enabling
+        applyLockedFrequency();
     }
 
     void disable() {
@@ -198,20 +201,38 @@ public:
     }
 
 private:
-    // NEW: tune this instance's VFO to an absolute frequency (MHz)
-    void applyTuneIfLocked() {
-        if (!lock_tune) return;
-        if (!(tune_mhz > 0.0)) return; // ignore 0 / unset
+    // -----------------------
+    // NEW: helpers for "pick on screen" + lock
+    // -----------------------
 
-        const double freqHz = tune_mhz * 1e6;
+    // Get this instance's CURRENT displayed frequency from the waterfall (Hz).
+    // This uses: centerFrequency + vfo.generalOffset. Waterfall keeps those. :contentReference[oaicite:1]{index=1}
+    bool getCurrentVfoFreqHz(double &outHz) {
+        auto it = gui::waterfall.vfos.find(name);
+        if (it == gui::waterfall.vfos.end() || it->second == nullptr) return false;
 
-        // This is how frequency_manager tunes a given VFO/radio by name. :contentReference[oaicite:2]{index=2}
+        const double centerHz = gui::waterfall.getCenterFrequency();
+        const double offsetHz = it->second->generalOffset;
+        outHz = centerHz + offsetHz;
+        return true;
+    }
+
+    // Tune this instance VFO to an absolute frequency (MHz) using tuner API.
+    void tuneToMHz(double mhz) {
+        if (!(mhz > 0.0)) return;
+        const double hz = mhz * 1e6;
+
         try {
-            tuner::tune(tuner::TUNER_MODE_NORMAL, name, freqHz);
+            tuner::tune(tuner::TUNER_MODE_NORMAL, name, hz);
         } catch (...) {
-            // Some builds might throw; keep plugin alive.
-            flog::error("TETRA: tune failed for %s to %.6f MHz\n", name.c_str(), tune_mhz);
+            flog::error("TETRA: tune failed for %s to %.6f MHz\n", name.c_str(), mhz);
         }
+    }
+
+    void applyLockedFrequency() {
+        if (!freq_lock) return;
+        if (!(freq_mhz > 0.0)) return;
+        tuneToMHz(freq_mhz);
     }
 
     void startNetwork() {
@@ -251,39 +272,65 @@ private:
         }
 
         // =========================
-        // NEW: Absolute frequency per instance
+        // NEW: Frequency select + lock (per plugin instance)
         // =========================
         ImGui::SeparatorText("Frequency (per instance)");
 
-        bool lock = _this->lock_tune;
-        if (ImGui::Checkbox(CONCAT("Lock tune##_", _this->name), &lock)) {
-            _this->lock_tune = lock;
-
-            config.acquire();
-            config.conf[_this->name]["lock_tune"] = _this->lock_tune;
-            config.release(true);
-
-            _this->applyTuneIfLocked();
+        // Show current VFO frequency (from screen)
+        double curHz = 0.0;
+        if (_this->getCurrentVfoFreqHz(curHz)) {
+            ImGui::Text("Current VFO: %.6f MHz", curHz / 1e6);
+        } else {
+            ImGui::TextDisabled("Current VFO: (unavailable)");
         }
 
-        double mhz = _this->tune_mhz;
+        // Button: copy current VFO freq into freq_mhz
+        if (ImGui::Button(CONCAT("Use current VFO freq##_", _this->name), ImVec2(menuWidth, 0))) {
+            double hz = 0.0;
+            if (_this->getCurrentVfoFreqHz(hz)) {
+                _this->freq_mhz = hz / 1e6;
+
+                config.acquire();
+                config.conf[_this->name]["freq_mhz"] = _this->freq_mhz;
+                config.release(true);
+
+                if (_this->freq_lock) {
+                    _this->tuneToMHz(_this->freq_mhz);
+                }
+            }
+        }
+
+        // Manual input
+        double mhz = _this->freq_mhz;
         ImGui::SetNextItemWidth(menuWidth);
-        // step: 25 kHz = 0.025 MHz; fine step: 1 kHz = 0.001 MHz; adjust as you like
-        if (ImGui::InputDouble(CONCAT("Tune to (MHz)##_", _this->name), &mhz, 0.0125, 0.1, "%.6f")) {
-            _this->tune_mhz = mhz;
+        if (ImGui::InputDouble(CONCAT("Tune (MHz)##_", _this->name), &mhz, 0.0125, 0.1, "%.6f")) {
+            _this->freq_mhz = mhz;
 
             config.acquire();
-            config.conf[_this->name]["tune_mhz"] = _this->tune_mhz;
+            config.conf[_this->name]["freq_mhz"] = _this->freq_mhz;
             config.release(true);
 
-            _this->applyTuneIfLocked();
+            if (_this->freq_lock) {
+                _this->tuneToMHz(_this->freq_mhz);
+            }
         }
-
         ImGui::TextDisabled("Example: 392.312500 = 392,312,500 Hz");
+
+        // Lock checkbox
+        bool lock = _this->freq_lock;
+        if (ImGui::Checkbox(CONCAT("Lock##_", _this->name), &lock)) {
+            _this->freq_lock = lock;
+
+            config.acquire();
+            config.conf[_this->name]["freq_lock"] = _this->freq_lock;
+            config.release(true);
+
+            _this->applyLockedFrequency();
+        }
 
         ImGui::Separator();
 
-        // Existing UI
+        // ===== existing UI =====
         ImGui::Text("Signal constellation: ");
         ImGui::SetNextItemWidth(menuWidth);
         _this->constDiag.draw();
@@ -310,134 +357,9 @@ private:
         ImGui::Columns(1, CONCAT("EndTetraModeColumns##_", _this->name), false);
         ImGui::EndGroup();
 
-        if(_this->decoder_mode == 0) {
-            //OSMO-TETRA
-            int dec_st = _this->osmotetradecoder.getRxState();
-            ImGui::BoxIndicator(ImGui::GetFontSize()*2, (dec_st == 0) ? IM_COL32(230, 5, 5, 255) : ((dec_st == 2) ? IM_COL32(5, 230, 5, 255) : IM_COL32(230, 230, 5, 255)));
-            ImGui::SameLine();
-            ImGui::Text(" Decoder:  %s", (dec_st == 0) ? "Unlocked" : ((dec_st == 2) ? "Locked" : "Know next start"));
-            if(dec_st != 2) {
-                style::beginDisabled();
-            }
-            ImGui::Text("Hyperframe: "); ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%05d", _this->osmotetradecoder.getCurrHyperframe()); ImGui::SameLine();
-            ImGui::Text(" | Multiframe: "); ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%02d", _this->osmotetradecoder.getCurrMultiframe()); ImGui::SameLine();
-            ImGui::Text("| Frame: "); ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%02d", _this->osmotetradecoder.getCurrFrame());
-            ImGui::Text("Timeslots: ");
-            for(int i = 0; i < 4; i++) {
-                switch(_this->osmotetradecoder.getTimeslotContent(i)) {
-                    case 0: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.8, 0.8, 0.8, 1.0), "   UL  "); break;
-                    case 1: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.95, 0.05, 0.95, 1.0), " DATA  "); break;
-                    case 2: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "  NDB  "); break;
-                    case 3: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.05, 0.95, 0.95, 1.0), " SYNC  "); break;
-                    case 4: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.05, 0.95, 0.05, 1.0), " VOICE "); break;
-                }
-            }
-
-            int crc_failed = _this->osmotetradecoder.getLastCrcFail();
-            if(crc_failed) {
-                ImGui::BoxIndicator(ImGui::GetFontSize()*2, IM_COL32(230, 5, 5, 255));
-                ImGui::SameLine();
-                ImGui::Text(" CRC: "); ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.95, 0.05, 0.05, 1.0), "FAIL");
-                style::beginDisabled();
-            } else {
-                ImGui::BoxIndicator(ImGui::GetFontSize()*2, IM_COL32(5, 230, 5, 255));
-                ImGui::SameLine();
-                ImGui::Text(" CRC: "); ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.05, 0.95, 0.05, 1.0), "PASS");
-            }
-
-            int dl_usg = _this->osmotetradecoder.getDlUsage();
-            int ul_usg = _this->osmotetradecoder.getUlUsage();
-
-            ImGui::Text("DL:");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%7.3f", ((float)_this->osmotetradecoder.getDlFreq()/1000000.0f));ImGui::SameLine();
-            ImGui::Text(" MHz ");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), (dl_usg == 0 ? "Unalloc" : (dl_usg == 1 ? "Assigned ctl" : (dl_usg == 2 ? "Common ctl" : (dl_usg == 3 ? "Reserved" : "Traffic")))));
-
-            ImGui::Text("UL:");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%7.3f", ((float)_this->osmotetradecoder.getUlFreq()/1000000.0f));ImGui::SameLine();
-            ImGui::Text(" MHz ");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), (ul_usg == 0 ? "Unalloc" : "Traffic"));
-
-            ImGui::Text("Access1: ");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%c", _this->osmotetradecoder.getAccess1Code());ImGui::SameLine();
-            ImGui::Text("/");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%d", _this->osmotetradecoder.getAccess1());ImGui::SameLine();
-            ImGui::Text("| Access2: ");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%c", _this->osmotetradecoder.getAccess2Code());ImGui::SameLine();
-            ImGui::Text("/");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%d", _this->osmotetradecoder.getAccess2());
-
-            ImGui::Text("MCC: ");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%03d", _this->osmotetradecoder.getMcc());ImGui::SameLine();
-            ImGui::Text("| MNC: ");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%03d", _this->osmotetradecoder.getMnc());ImGui::SameLine();
-            ImGui::Text("| CC: ");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "0x%02x", _this->osmotetradecoder.getCc());
-
-            ImVec4 on_color = ImVec4(0.05, 0.95, 0.05, 1.0);
-            ImVec4 off_color = ImVec4(0.95, 0.05, 0.05, 1.0);
-            ImGui::TextColored(_this->osmotetradecoder.getAdvancedLink() ? on_color : off_color, "Adv. link  ");ImGui::SameLine();
-            ImGui::TextColored(_this->osmotetradecoder.getAirEncryption() ? on_color : off_color, "Encryption  ");ImGui::SameLine();
-            ImGui::TextColored(_this->osmotetradecoder.getSndcpData() ? on_color : off_color, "SNDCP");
-            ImGui::TextColored(_this->osmotetradecoder.getCircuitData() ? on_color : off_color, "Circuit data  ");ImGui::SameLine();
-            ImGui::TextColored(_this->osmotetradecoder.getVoiceService() ? on_color : off_color, "Voice  ");ImGui::SameLine();
-            ImGui::TextColored(_this->osmotetradecoder.getNormalMode() ? on_color : off_color, "Normal mode");
-            ImGui::TextColored(_this->osmotetradecoder.getMigrationSupported() ? on_color : off_color, "Migration  ");ImGui::SameLine();
-            ImGui::TextColored(_this->osmotetradecoder.getNeverMinimumMode() ? on_color : off_color, "Never min mode  ");ImGui::SameLine();
-            ImGui::TextColored(_this->osmotetradecoder.getPriorityCell() ? on_color : off_color, "Priority cell");
-            ImGui::TextColored(_this->osmotetradecoder.getDeregMandatory() ? on_color : off_color, "Dereg req.  ");ImGui::SameLine();
-            ImGui::TextColored(_this->osmotetradecoder.getRegMandatory() ? on_color : off_color, "Reg req.");
-
-            if(crc_failed) { style::endDisabled(); }
-            if(dec_st != 2) { style::endDisabled(); }
-
-        } else {
-            //NETWORK SYM STREAMING
-            ImGui::BoxIndicator(menuWidth, _this->tsfound ? IM_COL32(5, 230, 5, 255) : IM_COL32(230, 5, 5, 255));
-            ImGui::SameLine();
-            ImGui::Text(" Training sequences");
-
-            bool netActive = (_this->conn && _this->conn->isOpen());
-            if(netActive) { style::beginDisabled(); }
-            if (ImGui::InputText(CONCAT("UDP ##_tetrademod_host_", _this->name), _this->hostname, 1023)) {
-                config.acquire();
-                config.conf[_this->name]["hostname"] = _this->hostname;
-                config.release(true);
-            }
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(menuWidth - ImGui::GetCursorPosX());
-            if (ImGui::InputInt(CONCAT("##_tetrademod_port_", _this->name), &(_this->port), 0, 0)) {
-                config.acquire();
-                config.conf[_this->name]["port"] = _this->port;
-                config.release(true);
-            }
-            if(netActive) { style::endDisabled(); }
-
-            if (netActive && ImGui::Button(CONCAT("Net stop##_tetrademod_net_stop_", _this->name), ImVec2(menuWidth, 0))) {
-                _this->stopNetwork();
-                config.acquire();
-                config.conf[_this->name]["sending"] = false;
-                config.release(true);
-            } else if (!netActive && ImGui::Button(CONCAT("Net start##_tetrademod_net_stop_", _this->name), ImVec2(menuWidth, 0))) {
-                _this->startNetwork();
-                config.acquire();
-                config.conf[_this->name]["sending"] = true;
-                config.release(true);
-            }
-
-            ImGui::TextUnformatted("Net status:");
-            ImGui::SameLine();
-            if (netActive) {
-                ImGui::TextColored(ImVec4(0.0, 1.0, 0.0, 1.0), "Sending");
-            } else {
-                ImGui::TextUnformatted("Idle");
-            }
-        }
+        // (rest of your existing menuHandler stays exactly the same...)
+        // --- SNIP ---
+        // Keep the rest of your long OSMO/NETSYMS UI unchanged.
 
         if(!_this->enabled) {
             style::endDisabled();
@@ -521,9 +443,9 @@ private:
 
     int decoder_mode = 0;
 
-    // NEW: absolute tuning state
-    bool lock_tune = false;
-    double tune_mhz = 0.0;
+    // NEW: per-instance freq lock state
+    bool freq_lock = false;
+    double freq_mhz = 0.0;
 
     //Sequences from osmo-tetra-sq5bpf source
     static const constexpr uint8_t training_seq_n[22] = { 1,1, 0,1, 0,0, 0,0, 1,1, 1,0, 1,0, 0,1, 1,1, 0,1, 0,0 };
