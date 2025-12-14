@@ -7,38 +7,22 @@
 #include <stdint.h>
 
 #ifndef MM_LOG_PATH
+/* Relative to the SDR++ working directory */
 #define MM_LOG_PATH "mm_log.txt"
 #endif
 
-#define MM_BROADCAST_ISSI 0xFFFFFFu
+/* 24-bit broadcast / "no ISSI" used widely in TETRA (0xFFFFFF == 16777215) */
+#define MM_BCAST_ISSI 0xFFFFFFu
 
-/* ---------- Thread-local LA (portable) ---------- */
-#if defined(_MSC_VER)
-    __declspec(thread) static int g_tls_la = -1;
-#elif defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
-    _Thread_local static int g_tls_la = -1;
-#elif defined(__GNUC__) || defined(__clang__)
-    static __thread int g_tls_la = -1;
-#else
-    /* Fallback: not truly TLS, but compiles */
-    static int g_tls_la = -1;
-#endif
-
-void mm_set_thread_la(int la) { g_tls_la = la; }
-int  mm_get_thread_la(void)   { return g_tls_la; }
-
-/* ---------- low-level append write (single write per log line) ---------- */
 #if defined(_WIN32)
   #include <io.h>
   #include <fcntl.h>
   #include <sys/stat.h>
-
   static int append_write_all(const char *data, size_t len)
   {
       int fd = _open(MM_LOG_PATH, _O_WRONLY | _O_CREAT | _O_APPEND, _S_IREAD | _S_IWRITE);
       if (fd < 0) return 0;
 
-      /* 1 write call is ideal, but _write can return partial: loop */
       const char *p = data;
       while (len > 0) {
           int n = _write(fd, p, (unsigned)len);
@@ -46,7 +30,6 @@ int  mm_get_thread_la(void)   { return g_tls_la; }
           p += n;
           len -= (size_t)n;
       }
-
       _close(fd);
       return (len == 0);
   }
@@ -54,7 +37,6 @@ int  mm_get_thread_la(void)   { return g_tls_la; }
   #include <unistd.h>
   #include <fcntl.h>
   #include <sys/stat.h>
-
   static int append_write_all(const char *data, size_t len)
   {
       int fd = open(MM_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -67,7 +49,6 @@ int  mm_get_thread_la(void)   { return g_tls_la; }
           p += (size_t)n;
           len -= (size_t)n;
       }
-
       close(fd);
       return (len == 0);
   }
@@ -77,27 +58,24 @@ static void make_timestamp(char out[64])
 {
     time_t t = time(NULL);
     struct tm tmv;
+
 #if defined(_WIN32)
     localtime_s(&tmv, &t);
 #else
-    tmv = *localtime(&t);
+    localtime_r(&t, &tmv);
 #endif
 
-    /* 19 chars + '\0' => 20; we give 64 to silence fortify warnings */
+    /* 19 chars + NUL => 20; we use 64 to silence truncation warnings */
     snprintf(out, 64, "%04d-%02d-%02d %02d:%02d:%02d",
              tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
              tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
 }
 
-static int should_drop_issi(uint32_t issi24)
-{
-    return ((issi24 & 0xFFFFFFu) == MM_BROADCAST_ISSI);
-}
-
-/* Legacy helper: parse ISSI from "ISSI=123..." lines */
+/* Best-effort: parse "ISSI=12345" from legacy text lines */
 static int parse_issi_from_line(const char *line, uint32_t *out_issi)
 {
-    if (!line) return 0;
+    if (!line || !out_issi) return 0;
+
     const char *p = strstr(line, "ISSI=");
     if (!p) return 0;
     p += 5;
@@ -116,96 +94,93 @@ static int parse_issi_from_line(const char *line, uint32_t *out_issi)
     return 1;
 }
 
-/* Write exactly ONE formatted line (single append buffer) */
-static void write_line_raw(const char *full_line)
+static int is_bcast(uint32_t issi)
 {
-    if (!full_line || !*full_line) return;
-    append_write_all(full_line, strlen(full_line));
+    issi &= 0xFFFFFFu;
+    return (issi == MM_BCAST_ISSI);
 }
 
-/* Legacy: only logs lines that contain a REAL ISSI (not 0xFFFFFF) */
-static void write_one_line_unfiltered(const char *line)
+/* One OS write per line => safe(ish) for multiple plugins simultaneously */
+static void write_line_raw(const char *payload)
+{
+    if (!payload || !*payload) return;
+
+    char ts[64];
+    make_timestamp(ts);
+
+    char out[1400];
+    int n = snprintf(out, sizeof(out), "[%s] %s\n", ts, payload);
+    if (n <= 0) return;
+
+    if ((size_t)n >= sizeof(out)) {
+        out[sizeof(out) - 2] = '\n';
+        out[sizeof(out) - 1] = '\0';
+        append_write_all(out, strlen(out));
+        return;
+    }
+
+    append_write_all(out, (size_t)n);
+}
+
+/* Legacy API: drop ISSI=0xFFFFFF only if we can parse it from the line.
+ * IMPORTANT: If we cannot parse ISSI, we still write the line (so we never “lose” data).
+ */
+void mm_log(const char *line)
 {
     if (!line || !*line) return;
 
     uint32_t issi = 0;
-    if (!parse_issi_from_line(line, &issi)) return;     /* no ISSI => skip */
-    if (should_drop_issi(issi)) return;                 /* 0xFFFFFF => skip */
-
-    char ts[64];
-    make_timestamp(ts);
-
-    char out[1200];
-    int n = snprintf(out, sizeof(out), "[%s] %s\n", ts, line);
-    if (n <= 0) return;
-
-    out[sizeof(out)-1] = '\0';
-    write_line_raw(out);
-}
-
-/* Preferred: ctx logging (no parsing, adds LA automatically) */
-static void write_one_line_ctx(uint32_t issi, int la, const char *payload)
-{
-    if (!payload || !*payload) return;
-
-    issi &= 0xFFFFFFu;
-    if (should_drop_issi(issi)) return;
-
-    char ts[64];
-    make_timestamp(ts);
-
-    char out[1200];
-    int n;
-
-    if (la >= 0) {
-        n = snprintf(out, sizeof(out),
-                     "[%s] LA=%d ISSI=%u (0x%06X) %s\n",
-                     ts, la, (unsigned)issi, (unsigned)issi, payload);
-    } else {
-        n = snprintf(out, sizeof(out),
-                     "[%s] ISSI=%u (0x%06X) %s\n",
-                     ts, (unsigned)issi, (unsigned)issi, payload);
+    if (parse_issi_from_line(line, &issi)) {
+        if (is_bcast(issi)) return;
     }
-    if (n <= 0) return;
 
-    out[sizeof(out)-1] = '\0';
-    write_line_raw(out);
-}
-
-/* ---------- public API ---------- */
-
-void mm_log(const char *line)
-{
-    write_one_line_unfiltered(line);
+    write_line_raw(line);
 }
 
 void mm_logf(const char *fmt, ...)
 {
     if (!fmt || !*fmt) return;
 
-    char buf[800];
+    char buf[900];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
 
-    write_one_line_unfiltered(buf);
+    mm_log(buf);
 }
 
+/* Preferred API: we already know ISSI and LA, so we can filter correctly (no text parsing). */
 void mm_log_ctx(uint32_t issi, int la, const char *line)
 {
-    write_one_line_ctx(issi, la, line);
+    if (!line || !*line) return;
+
+    issi &= 0xFFFFFFu;
+    if (is_bcast(issi) || issi == 0) return;
+
+    char payload[1100];
+    if (la >= 0) {
+        snprintf(payload, sizeof(payload),
+                 "LA=%d ISSI=%u (0x%06X) %s",
+                 la, (unsigned)issi, (unsigned)issi, line);
+    } else {
+        snprintf(payload, sizeof(payload),
+                 "ISSI=%u (0x%06X) %s",
+                 (unsigned)issi, (unsigned)issi, line);
+    }
+
+    write_line_raw(payload);
 }
 
 void mm_logf_ctx(uint32_t issi, int la, const char *fmt, ...)
 {
     if (!fmt || !*fmt) return;
 
-    char buf[800];
+    char msg[900];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
 
-    write_one_line_ctx(issi, la, buf);
+    mm_log_ctx(issi, la, msg);
 }
