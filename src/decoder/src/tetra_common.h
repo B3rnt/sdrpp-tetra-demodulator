@@ -293,6 +293,9 @@ struct tetra_display_state {
 	bool priority_cell;
 	bool dereg_mandatory;
 	bool reg_mandatory;
+	/* Added: timeslot content hysteresis / majority vote state */
+	uint8_t ts_hist[4][5];
+	uint8_t ts_hist_idx[4];
 };
 
 struct tetra_mac_state {
