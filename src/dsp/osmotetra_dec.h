@@ -142,6 +142,10 @@ namespace dsp {
         int getCc() {
             return tms->t_display_st->cc;
         }
+        int getLA() {
+            if (!tms || !tms->tcs) return -1;
+            return tms->tcs->la;
+        }
         bool getLastCrcFail() {
             return tms->t_display_st->last_crc_fail;
         }
