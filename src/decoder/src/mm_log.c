@@ -11,19 +11,9 @@
 
 #define MM_BROADCAST_ISSI 0xFFFFFFu
 
-/* Drop ALLES wat 0xFFFFFF is (ook als het per ongeluk extra info bevat) */
-static int is_broadcast_text(const char *line)
-{
-    if (!line) return 0;
-    return (strstr(line, "ISSI=16777215") != NULL) || (strstr(line, "0xFFFFFF") != NULL);
-}
-
 static void mm_write_line(const char *line)
 {
     if (!line || !*line) return;
-
-    /* String-based filter (voor jouw huidige logs die ISSI al in de tekst hebben) */
-    if (is_broadcast_text(line)) return;
 
     FILE *f = fopen(MM_LOG_PATH, "a");
     if (!f) return;
@@ -48,6 +38,7 @@ static void mm_write_line(const char *line)
 
 void mm_log(const char *line)
 {
+    /* Ongefilterd: laat alles door zolang callers nog oud zijn */
     mm_write_line(line);
 }
 
@@ -68,8 +59,8 @@ void mm_log_with_ctx(uint32_t issi, const char *line)
 {
     if (!line || !*line) return;
 
-    /* Context-based filter (beste oplossing) */
-    if (issi == MM_BROADCAST_ISSI) return;
+    /* Hier filteren we streng: 0xFFFFFF = weg */
+    if ((issi & 0xFFFFFFu) == MM_BROADCAST_ISSI) return;
 
     mm_write_line(line);
 }
@@ -78,8 +69,8 @@ void mm_logf_with_ctx(uint32_t issi, const char *fmt, ...)
 {
     if (!fmt || !*fmt) return;
 
-    /* Context-based filter */
-    if (issi == MM_BROADCAST_ISSI) return;
+    /* Hier filteren we streng: 0xFFFFFF = weg */
+    if ((issi & 0xFFFFFFu) == MM_BROADCAST_ISSI) return;
 
     char buf[512];
     va_list ap;
