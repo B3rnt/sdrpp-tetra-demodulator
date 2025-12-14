@@ -69,7 +69,12 @@ static void try_decode_to_mle(struct tetra_mac_state *tms, struct msgb *msg)
 
     /* --- ADDED: log PDISC + ISSI/SSI context --- */
     if (l2len >= 1) {
-        uint8_t pdisc = msg->l3h[0] & 0x0F;
+        uint8_t pdisc;
+        /* l3h is usually unpacked bits (0/1) in this chain. */
+        int unpacked = 1;
+        for (unsigned int i = 0; i < l2len; i++) { if (msg->l3h[i] > 1) { unpacked = 0; break; } }
+        if (unpacked && l2len >= 3) pdisc = (uint8_t)bits_to_uint(msg->l3h, 3);
+        else pdisc = msg->l3h[0] & 0x0F;
 
         if (pdisc == 1) { /* MM */
             char buf[256];
