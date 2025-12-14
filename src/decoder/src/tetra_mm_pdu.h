@@ -62,16 +62,11 @@ static inline const char *tetra_get_mm_pdut_name(uint8_t pdu_type, int uplink)
     }
 }
 
-/*
- * Legacy API used by some code: returns value_string lookup.
- * NOTE: This should NOT log anymore; log later when you have SSI/GSSI/LA/CAUSE context.
- */
+/* Legacy API used by some code: returns value_string lookup. */
 const char *tetra_mm_pdu_get_name(uint8_t pdu_type);
 
-/*
- * Optional helper for basic one-line logging (no double logs).
- * Call this from the place where you already know ISSI/SSI/GSSI/etc.
- */
+/* Optional helper for basic one-line log (still no SSI/GSSI/CAUSE).
+   This will NOT log if ISSI==0xFFFFFF, due to mm_logf_with_ctx filtering. */
 void tetra_mm_pdu_log_basic(uint32_t issi, uint8_t pdu_type);
 
 #ifdef __cplusplus
