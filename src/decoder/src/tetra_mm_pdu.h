@@ -62,6 +62,18 @@ static inline const char *tetra_get_mm_pdut_name(uint8_t pdu_type, int uplink)
     }
 }
 
+/*
+ * Legacy API used by some code: returns value_string lookup.
+ * NOTE: This should NOT log anymore; log later when you have SSI/GSSI/LA/CAUSE context.
+ */
+const char *tetra_mm_pdu_get_name(uint8_t pdu_type);
+
+/*
+ * Optional helper for basic one-line logging (no double logs).
+ * Call this from the place where you already know ISSI/SSI/GSSI/etc.
+ */
+void tetra_mm_pdu_log_basic(uint32_t issi, uint8_t pdu_type);
+
 #ifdef __cplusplus
 }
 #endif
