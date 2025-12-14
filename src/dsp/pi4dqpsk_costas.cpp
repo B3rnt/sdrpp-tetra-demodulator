@@ -1,4 +1,5 @@
 #include "pi4dqpsk_costas.h"
+#include <math.h>
 
 namespace dsp {
     namespace loop {
@@ -21,10 +22,14 @@ namespace dsp {
         }
 
         float PI4DQPSK_COSTAS::errorFunction(complex_t val) {
-            float err = 0;
-            //default qpsk error function
-            err = (math::step(val.re) * val.im) - (math::step(val.im) * val.re);
-            return std::clamp<float>(err, -1.0f, 1.0f);
+            // Default QPSK error function
+            float err = (math::step(val.re) * val.im) - (math::step(val.im) * val.re);
+            // Weight loop error by amplitude to reduce jitter at low SNR
+            float a = sqrtf(val.re*val.re + val.im*val.im);
+            if (a < 1.0f) { err *= a; }
+            // Soft limiter (less "bang-bang" than hard clamp)
+            err = err / (1.0f + fabsf(err));
+            return err;
         }
     }
 }

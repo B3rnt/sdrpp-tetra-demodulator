@@ -1,6 +1,12 @@
 #include "dqpsk_sym_extr.h"
 
 namespace dsp {
+    static inline float wrapPhaseDiff(float d) {
+        while (d >  FL_M_PI) d -= 2.0f * FL_M_PI;
+        while (d < -FL_M_PI) d += 2.0f * FL_M_PI;
+        return d;
+    }
+
     int DQPSKSymbolExtractor::process(int count, const complex_t* in, uint8_t* out) {
         for(int i = 0; i < count; i++) {
             complex_t sym_c = in[i];
@@ -8,7 +14,10 @@ namespace dsp {
             bool b = sym_c.re<0;
             complex_t ideal_sym = {b?-0.7071f : 0.7071f, a?-0.7071f : 0.7071f};
             // float dist = fabsf(sqrtf(((ideal_sym.re-sym_c.re)*(ideal_sym.re-sym_c.re))+((ideal_sym.im-sym_c.im)*(ideal_sym.im-sym_c.im))));
-            float dist = std::abs(ideal_sym.phase() - sym_c.phase());
+            float dphi = wrapPhaseDiff(ideal_sym.phase() - sym_c.phase());
+            // Weight error metric by amplitude to avoid noisy "sync flapping" on weak samples
+            float amp = sym_c.fastAmplitude();
+            float dist = fabsf(dphi) * (amp < 0.15f ? 0.0f : 1.0f);
             errorbuf[errorptr] = dist;
             errorptr++;
             if(errorptr >= SYNC_DETECT_BUF) {

@@ -140,7 +140,9 @@ namespace dsp {
                     complex_t hbe_out;
                     lbandedgerrc.process(1, &(x), &lbe_out);
                     hbandedgerrc.process(1, &(x), &hbe_out);
-                    float freqError = hbe_out.fastAmplitude() - lbe_out.fastAmplitude();
+                    float hp = hbe_out.re*hbe_out.re + hbe_out.im*hbe_out.im;
+                    float lp = lbe_out.re*lbe_out.re + lbe_out.im*lbe_out.im;
+                    float freqError = hp - lp;
                     // dbg_last_err = pcl.freq;
                     pcl.advance(freqError);
                     out[i] = x;

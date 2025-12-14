@@ -1,4 +1,5 @@
 #include "complex_fd.h"
+#include <math.h>
 
 namespace dsp {
     namespace clock_recovery {
@@ -124,6 +125,10 @@ namespace dsp {
                     // Calculate error
                     // error = ((outVal.re * dfdt.re) + (outVal.im * dfdt.im));
                     error = (((outVal.re > 0 ? 1.0f : -1.0f) * dfdt.re) + ((outVal.im > 0 ? 1.0f : -1.0f) * dfdt.im));
+                    // Weight timing error by amplitude to reduce noise-driven jitter
+                    float a = sqrtf(outVal.re*outVal.re + outVal.im*outVal.im);
+                    if (a < 1.0f) { error *= a; }
+
                 } else {
                     error = 0;
                 }
