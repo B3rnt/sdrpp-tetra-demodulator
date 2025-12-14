@@ -25,38 +25,135 @@ static const char *mm_auth_subtype_str(uint8_t st) {
 
 static void mm_try_pretty_log(uint32_t issi, uint32_t la, const uint8_t *mm_bits, unsigned int mm_len_bits)
 {
-    if (!mm_bits || mm_len_bits < 4) return;
-    uint8_t pdu_type = (uint8_t)bits_to_uint(mm_bits, 4);
+    if (!mm_bits || mm_len_bits < 4)
+        return;
 
-    /* D-AUTHENTICATION = 0x1 */
-    if (pdu_type == 0x1 && mm_len_bits >= 6) {
-        uint8_t sub = (uint8_t)bits_to_uint(mm_bits + 4, 2);
-        const char *s = mm_auth_subtype_str(sub);
-        if (sub == 0) {
-            mm_logf_ctx(issi, la, "Status: Authenticatie vereist (D-AUTHENTICATION %s)", s);
-        } else {
-            mm_logf_ctx(issi, la, "D-AUTHENTICATION %s", s);
+    unsigned int pos = 0;
+#define HAVE(N) (pos + (N) <= mm_len_bits)
+#define GET(N)  (HAVE(N) ? bits_to_uint(mm_bits + pos, (N)) : 0)
+#define ADV(N)  do { pos += (N); } while (0)
+
+    uint8_t pdu_type = (uint8_t)GET(4);
+    ADV(4);
+
+    /* D-AUTHENTICATION (0x1) */
+    if (pdu_type == 0x1) {
+        if (!HAVE(2)) {
+            mm_logf_ctx(issi, la, "MM too short (%u bits), skip", mm_len_bits);
+            goto out;
         }
-        return;
+        uint8_t sub = (uint8_t)GET(2);
+        ADV(2);
+
+        if (sub == 0x0) {
+            mm_logf_ctx(issi, la, "Status: Authenticatie vereist (%s)", mm_auth_subtype_str(sub));
+        } else if (sub == 0x3) {
+            mm_logf_ctx(issi, la, "%s", mm_auth_subtype_str(sub));
+        } else {
+            mm_logf_ctx(issi, la, "D-AUTH subtype=%u (%s)", sub, mm_auth_subtype_str(sub));
+        }
+        goto out;
     }
 
-    /* Location update / roaming-ish hints */
-    if (pdu_type == 0x5) { /* D-LOC-UPD-ACC */
-        mm_logf_ctx(issi, la, "Status: Location update accept (mogelijk roaming)");
-        return;
+    /* D-CK-CHG-DEM (0x2) — extract CCK_identifier when present (tetra-kit compatible) */
+    if (pdu_type == 0x2) {
+        if (!HAVE(1 + 2 + 3)) {
+            mm_logf_ctx(issi, la, "MM type=0x2 (D-CK-CHG-DEM) too short (%u bits), skip", mm_len_bits);
+            goto out;
+        }
+        uint8_t ack = (uint8_t)GET(1); ADV(1);
+        uint8_t cs  = (uint8_t)GET(2); ADV(2);
+        uint8_t kct = (uint8_t)GET(3); ADV(3);
+
+        if ((kct == 1 || kct == 3) && HAVE(16)) {
+            uint16_t cck = (uint16_t)GET(16);
+            mm_logf_ctx(issi, la, "CCK_identifier: %u (D-CK-CHG-DEM ack=%u class=%u kct=%u)", cck, ack, cs, kct);
+        } else {
+            mm_logf_ctx(issi, la, "D-CK-CHG-DEM ack=%u class=%u kct=%u", ack, cs, kct);
+        }
+        goto out;
     }
-    if (pdu_type == 0x9) { /* D-LOC-UPD-PROC */
-        mm_logf_ctx(issi, la, "Status: Roaming / Location update");
-        return;
+
+    /* D-LOC-UPD-ACC (0x5) — best-effort extraction of GSSI and auth result from Type-34 elements */
+    if (pdu_type == 0x5) {
+        if (!HAVE(3)) {
+            mm_logf_ctx(issi, la, "MM type=0x5 (D-LOC-UPD-ACC) too short (%u bits), skip", mm_len_bits);
+            goto out;
+        }
+        uint8_t accept_type = (uint8_t)GET(3);
+        ADV(3);
+
+        /* Optional fields (mostly skipped) */
+        uint8_t o = HAVE(1) ? (uint8_t)GET(1) : 0; ADV(1);
+        if (o && HAVE(24)) ADV(24);        /* SSI */
+        uint8_t p = HAVE(1) ? (uint8_t)GET(1) : 0; ADV(1);
+        if (p && HAVE(24)) ADV(24);        /* address extension */
+        uint8_t q = HAVE(1) ? (uint8_t)GET(1) : 0; ADV(1);
+        if (q && HAVE(4))  ADV(4);         /* subscriber class */
+        uint8_t r = HAVE(1) ? (uint8_t)GET(1) : 0; ADV(1);
+        if (r && HAVE(1))  ADV(1);         /* energy saving mode */
+        uint8_t t = HAVE(1) ? (uint8_t)GET(1) : 0; ADV(1);
+        if (t && HAVE(3))  ADV(3);         /* SCCH info */
+
+        uint8_t m = HAVE(1) ? (uint8_t)GET(1) : 0; ADV(1);
+
+        uint32_t gssi = 0;
+        uint8_t  have_gssi = 0;
+
+        if (m) {
+            /* Type-34 elements: (elementType:2, elementId:4, ...).
+             * Implement:
+             * - (et=3,eid=0x5) Group identity location accept (extract first group identity as GSSI)
+             * - (et=3,eid=0xA) Authentication downlink (emit auth_ok)
+             *
+             * Stop on unknown element (no safe length to skip).
+             */
+            while (HAVE(6)) {
+                uint8_t et  = (uint8_t)GET(2); ADV(2);
+                uint8_t eid = (uint8_t)GET(4); ADV(4);
+
+                if (et != 3) break;
+
+                if (eid == 0x5) {
+                    if (!HAVE(3)) break;
+                    uint8_t ngrp = (uint8_t)GET(3); ADV(3);
+
+                    for (uint8_t i = 0; i < ngrp; i++) {
+                        if (!HAVE(2 + 24)) break;
+                        uint8_t addr_type = (uint8_t)GET(2); ADV(2);
+                        uint32_t g = GET(24); ADV(24);
+                        if (!have_gssi) { gssi = g; have_gssi = 1; }
+                        if (addr_type == 0x1 && HAVE(24)) ADV(24); /* address extension */
+                    }
+                } else if (eid == 0xA) {
+                    if (!HAVE(3)) break;
+                    uint8_t auth_ok = (uint8_t)GET(1); ADV(1);
+                    ADV(1); /* supply TEI */
+                    ADV(1); /* ck provisioning flag (not parsed here yet) */
+                    if (auth_ok) {
+                        mm_logf_ctx(issi, la, "BS result to MS authentication: Authentication successful or no authentication currently in progress");
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if (have_gssi) {
+            mm_logf_ctx(issi, la, "MS request for registration ACCEPTED for SSI: %u GSSI: %u (accept_type=%u)", issi, gssi, accept_type);
+        } else {
+            mm_logf_ctx(issi, la, "D-LOC-UPD-ACC (accept_type=%u)", accept_type);
+        }
+        goto out;
     }
-    if (pdu_type == 0x7) { /* D-LOC-UPD-REJ */
-        mm_logf_ctx(issi, la, "Status: Location update reject");
-        return;
-    }
-    if (pdu_type == 0xC) { /* D-MM-STATUS */
-        mm_logf_ctx(issi, la, "Status: MM status");
-        return;
-    }
+
+    /* Fallback */
+    mm_logf_ctx(issi, la, "MM type=0x%X (unparsed) len=%u bits", pdu_type, mm_len_bits);
+
+out:
+#undef HAVE
+#undef GET
+#undef ADV
 }
 
 /* Receive TL-SDU (LLC SDU == MLE PDU) */
