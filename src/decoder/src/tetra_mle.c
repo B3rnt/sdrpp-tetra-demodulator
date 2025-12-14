@@ -12,6 +12,53 @@
 /* ✅ nodig om tms->tcs->la te mogen gebruiken */
 #include "crypto/tetra_crypto.h"
 
+
+static const char *mm_auth_subtype_str(uint8_t st) {
+    switch (st & 0x3u) {
+    case 0: return "DEMAND";
+    case 1: return "RESPONSE";
+    case 2: return "RESULT";
+    case 3: return "REJECT";
+    default: return "UNKNOWN";
+    }
+}
+
+static void mm_try_pretty_log(uint32_t issi, uint32_t la, const uint8_t *mm_bits, unsigned int mm_len_bits)
+{
+    if (!mm_bits || mm_len_bits < 4) return;
+    uint8_t pdu_type = (uint8_t)bits_to_uint(mm_bits, 4);
+
+    /* D-AUTHENTICATION = 0x1 */
+    if (pdu_type == 0x1 && mm_len_bits >= 6) {
+        uint8_t sub = (uint8_t)bits_to_uint(mm_bits + 4, 2);
+        const char *s = mm_auth_subtype_str(sub);
+        if (sub == 0) {
+            mm_logf_ctx(issi, la, "Status: Authenticatie vereist (D-AUTHENTICATION %s)", s);
+        } else {
+            mm_logf_ctx(issi, la, "D-AUTHENTICATION %s", s);
+        }
+        return;
+    }
+
+    /* Location update / roaming-ish hints */
+    if (pdu_type == 0x5) { /* D-LOC-UPD-ACC */
+        mm_logf_ctx(issi, la, "Status: Location update accept (mogelijk roaming)");
+        return;
+    }
+    if (pdu_type == 0x9) { /* D-LOC-UPD-PROC */
+        mm_logf_ctx(issi, la, "Status: Roaming / Location update");
+        return;
+    }
+    if (pdu_type == 0x7) { /* D-LOC-UPD-REJ */
+        mm_logf_ctx(issi, la, "Status: Location update reject");
+        return;
+    }
+    if (pdu_type == 0xC) { /* D-MM-STATUS */
+        mm_logf_ctx(issi, la, "Status: MM status");
+        return;
+    }
+}
+
 /* Receive TL-SDU (LLC SDU == MLE PDU) */
 
 static int ubits_to_hex(char *dst, size_t dst_len, const uint8_t *ubits, unsigned int nbits)
@@ -76,7 +123,10 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
                     (unsigned)mm_type,
                     mm_short ? mm_short : "D-UNKNOWN");
 
-        /* Log raw MM payload (everything after pdisc+type) */
+        
+        /* Add a few human-friendly status messages (SDR#-style) */
+        mm_try_pretty_log(issi, la, bits + 3, len - 3);
+/* Log raw MM payload (everything after pdisc+type) */
         if (len > 7) {
             unsigned int payload_bits = len - 7;
             const uint8_t *payload = bits + 7;
