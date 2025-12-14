@@ -8,9 +8,8 @@ extern "C" {
 void mm_log(const char *line);
 void mm_logf(const char *fmt, ...);
 
-/* Gebruik deze overal waar je ISSI als variabele hebt */
-void mm_log_with_ctx(uint32_t issi, const char *line);
-void mm_logf_with_ctx(uint32_t issi, const char *fmt, ...);
+void mm_log_ctx(uint32_t issi, int la, const char *line);
+void mm_logf_ctx(uint32_t issi, int la, const char *fmt, ...);
 
 #ifdef __cplusplus
 }
