@@ -1,7 +1,4 @@
-/* Implementation of TETRA MM PDU parsing */
-
 #include "tetra_common.h"
-#include "mm_log.h"
 #include "tetra_mm_pdu.h"
 
 static const struct value_string mm_pdut_d_names[] = {
@@ -21,20 +18,8 @@ static const struct value_string mm_pdut_d_names[] = {
     { 0, NULL }
 };
 
-/* IMPORTANT: no logging here; just return name. */
+/* IMPORTANT: do NOT log here (prevents spam/double logs) */
 const char *tetra_mm_pdu_get_name(uint8_t pdu_type)
 {
     return get_value_string(mm_pdut_d_names, pdu_type);
-}
-
-/* Optional: basic single-line log for a MM PDU type */
-void tetra_mm_pdu_log_basic(uint32_t issi, uint8_t pdu_type)
-{
-    const char *short_name = tetra_get_mm_pdut_name(pdu_type, 0);
-
-    /* mm_logf_with_ctx filters out ISSI==0xFFFFFF automatically */
-    mm_logf_with_ctx(issi,
-                     "MM: %s (type=0x%X)",
-                     short_name ? short_name : "D-UNKNOWN",
-                     (unsigned)pdu_type);
 }
