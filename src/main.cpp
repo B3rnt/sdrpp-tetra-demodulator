@@ -284,7 +284,9 @@ private:
         // =========================
         // NEW: per-instance frequency lock UI
         // =========================
-        ImGui::SeparatorText("Frequency (per instance)");
+        ImGui::Separator();
+		ImGui::TextUnformatted("Frequency (per instance)");
+		ImGui::Separator();
 
         // Show current VFO frequency
         double curHz = 0.0;
