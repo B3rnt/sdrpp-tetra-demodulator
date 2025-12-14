@@ -17,13 +17,13 @@ enum tetra_mm_pdu_type_d {
     TMM_PDU_T_D_LOC_UPD_ACC     = 0x5,
     TMM_PDU_T_D_LOC_UPD_CMD     = 0x6,
     TMM_PDU_T_D_LOC_UPD_REJ     = 0x7,
-    /* RES */
+    /* RES 0x8 */
     TMM_PDU_T_D_LOC_UPD_PROC    = 0x9,
     TMM_PDU_T_D_ATT_DET_GRP     = 0xa,
     TMM_PDU_T_D_ATT_DET_GRP_ACK = 0xb,
     TMM_PDU_T_D_MM_STATUS       = 0xc,
-    /* RES */
-    /* RES */
+    /* RES 0xd */
+    /* RES 0xe */
     TMM_PDU_T_D_MM_PDU_NOTSUPP  = 0xf
 };
 
@@ -39,7 +39,7 @@ enum tetra_mm_loc_upd_acc_type {
     TMM_LUPD_ACC_T_DISABLED     = 7
 };
 
-/* Stable short-name helper */
+/* Stable short-name */
 static inline const char *tetra_get_mm_pdut_name(uint8_t pdu_type, int uplink)
 {
     (void)uplink;
@@ -62,8 +62,11 @@ static inline const char *tetra_get_mm_pdut_name(uint8_t pdu_type, int uplink)
     }
 }
 
-/* Legacy API: returns long name from value_string table (NO logging here). */
+/* Legacy API from osmo style */
 const char *tetra_mm_pdu_get_name(uint8_t pdu_type);
+
+/* Optional helper for single-line basic logging */
+void tetra_mm_pdu_log_basic(uint32_t issi, uint8_t pdu_type);
 
 #ifdef __cplusplus
 }
