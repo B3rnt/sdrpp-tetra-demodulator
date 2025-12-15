@@ -35,252 +35,134 @@ static const char *mm_auth_subtype_str(uint8_t st) {
  *   - eid 0x6 : CCK information (CCK_identifier)
  *   - eid 0xA : Authentication downlink (auth result)
  */
-static void mm_scan_type34_elements(uint32_t issi, uint32_t la,
-                                   const uint8_t *mm_bits, unsigned mm_len_bits,
+static void mm_scan_type34_elements(const uint8_t *bits, unsigned int bitlen,
+                                   unsigned int start_bit,
                                    uint32_t *out_gssi, uint8_t *out_have_gssi,
                                    uint8_t *out_cck_id, uint8_t *out_have_cck,
-                                   uint8_t *out_auth_ok, uint8_t *out_have_auth)
+                                   uint8_t *out_auth_ok, uint8_t *out_have_auth,
+                                   uint8_t *out_roam_lu, uint8_t *out_have_roam_lu,
+                                   uint8_t *out_itsi_attach, uint8_t *out_have_itsi_attach)
 {
-    if (!mm_bits || mm_len_bits < 16) return;
+    if (out_have_gssi) *out_have_gssi = 0;
+    if (out_have_cck)  *out_have_cck  = 0;
+    if (out_have_auth) *out_have_auth = 0;
+    if (out_have_roam_lu) *out_have_roam_lu = 0;
+    if (out_have_itsi_attach) *out_have_itsi_attach = 0;
 
-    /* patterns are 6-bit headers: et(2)=3 => '11' + eid(4) */
-    const uint32_t HDR_GSSI = 0b110101; /* et=3,eid=0x5 */
-    const uint32_t HDR_CCK  = 0b110110; /* et=3,eid=0x6 */
-    const uint32_t HDR_AUTH = 0b111010; /* et=3,eid=0xA */
+    if (!bits || bitlen <= start_bit) return;
 
-    /* scan all possible start positions; header is 6 bits */
-    for (unsigned p = 0; p + 6u <= mm_len_bits; p++) {
-        uint32_t hdr = bits_to_uint(mm_bits + p, 6);
-        if (hdr == HDR_GSSI) {
-            unsigned pos = p + 6u;
-            if (pos + 3u > mm_len_bits) continue;
-            uint8_t ngrp = (uint8_t)bits_to_uint(mm_bits + pos, 3); pos += 3u;
-            for (uint8_t i = 0; i < ngrp; i++) {
-                if (pos + 2u + 24u > mm_len_bits) break;
-                uint8_t addr_type = (uint8_t)bits_to_uint(mm_bits + pos, 2); pos += 2u;
-                uint32_t g = bits_to_uint(mm_bits + pos, 24); pos += 24u;
-                if (out_gssi && out_have_gssi && !*out_have_gssi) {
-                    *out_gssi = g;
-                    *out_have_gssi = 1;
-                }
-                /* address extension present when addr_type==1 */
-                if (addr_type == 0x1 && pos + 24u <= mm_len_bits) pos += 24u;
-            }
-        } else if (hdr == HDR_CCK) {
-            /* Very common layout: ncck(3) then first CCK_identifier(8).
-             * Some variants have more data; we only need the ID.
-             */
-            unsigned pos = p + 6u;
-            if (pos + 3u + 8u > mm_len_bits) continue;
-            uint8_t ncck = (uint8_t)bits_to_uint(mm_bits + pos, 3); pos += 3u;
-            if (ncck >= 1) {
-                uint8_t cck = (uint8_t)bits_to_uint(mm_bits + pos, 8);
-                if (out_cck_id && out_have_cck) {
-                    *out_cck_id = cck;
-                    *out_have_cck = 1;
-                }
-            }
-        } else if (hdr == HDR_AUTH) {
-            unsigned pos = p + 6u;
-            if (pos + 3u > mm_len_bits) continue;
-            uint8_t auth_ok = (uint8_t)bits_to_uint(mm_bits + pos, 1);
-            if (out_auth_ok && out_have_auth) {
-                *out_auth_ok = auth_ok;
-                *out_have_auth = 1;
-            }
+    unsigned int pos = start_bit;
+
+    while (pos + 8 <= bitlen) {
+        /* IE header: 5-bit ID + 3-bit length-in-bytes (as used by SDR-TETRA summary logic) */
+        uint32_t iei  = bits_to_uint(bits + pos, 5); pos += 5;
+        uint32_t blen = bits_to_uint(bits + pos, 3); pos += 3; /* bytes */
+        unsigned int ie_bits = (unsigned int)blen * 8;
+
+        if (pos + ie_bits > bitlen) break;
+
+        /* IDs here are "best-effort" to mimic SDR-TETRA's human log lines.
+           We only accept values when the length matches what we expect, to avoid garbage hits. */
+        if (iei == 0x01 && blen == 3 && out_gssi && out_have_gssi) {
+            *out_gssi = bits_to_uint(bits + pos, 24);
+            *out_have_gssi = 1;
+        } else if (iei == 0x02 && blen == 1 && out_cck_id && out_have_cck) {
+            *out_cck_id = (uint8_t)bits_to_uint(bits + pos, 8);
+            *out_have_cck = 1;
+        } else if (iei == 0x03 && blen == 1 && out_auth_ok && out_have_auth) {
+            *out_auth_ok = (uint8_t)(bits_to_uint(bits + pos, 1) & 1u);
+            *out_have_auth = 1;
+        } else if (iei == 0x04 && blen == 1 && out_roam_lu && out_have_roam_lu) {
+            *out_roam_lu = (uint8_t)(bits_to_uint(bits + pos, 1) & 1u);
+            *out_have_roam_lu = 1;
+        } else if (iei == 0x05 && blen == 1 && out_itsi_attach && out_have_itsi_attach) {
+            *out_itsi_attach = (uint8_t)(bits_to_uint(bits + pos, 1) & 1u);
+            *out_have_itsi_attach = 1;
         }
-    }
 
-    /* Emit SDR-Tetra-like lines when we have enough info */
-    if (out_have_auth && *out_have_auth) {
-        if (*out_auth_ok) {
-            /* do not log here; caller decides when to emit */
-} else {
-            /* do not log here; caller decides when to emit */
-}
-    }
-
-    if (out_have_gssi && *out_have_gssi) {
-        if (out_have_cck && *out_have_cck) {
-            mm_logf_ctx(issi, la, "MS request for registration/authentication ACCEPTED for SSI: %u GSSI: %u - Authentication successful or no authentication currently in progress - CCK_identifier: %u - Roaming location updating", issi, *out_gssi, *out_cck_id);
-        } else {
-            mm_logf_ctx(issi, la, "MS request for registration/authentication ACCEPTED for SSI: %u GSSI: %u", issi, *out_gssi);
-        }
+        pos += ie_bits;
     }
 }
 
-static void mm_try_pretty_log(uint32_t issi, uint32_t la, const uint8_t *mm_bits, unsigned int mm_len_bits)
+static void mm_try_pretty_log(uint32_t issi, uint16_t la,
+                              const uint8_t *mm_bits, unsigned int mm_len_bits)
 {
-    if (!mm_bits || mm_len_bits < 4)
-        return;
+    if (!mm_bits || mm_len_bits < 4) return;
 
     unsigned int pos = 0;
 #define HAVE(N) (pos + (N) <= mm_len_bits)
 #define GET(N)  (HAVE(N) ? bits_to_uint(mm_bits + pos, (N)) : 0)
 #define ADV(N)  do { pos += (N); } while (0)
 
-	/* Optional fields parsed from Type-3/4 elements (kept local; not all PDUs include them) */
-	uint32_t gssi = 0;
-	uint8_t cck_id = 0;
-	uint8_t have_gssi = 0;
-	uint8_t have_cck = 0;
-	uint8_t auth_ok = 0;
-	uint8_t have_auth = 0;
-
     uint8_t pdu_type = (uint8_t)GET(4);
     ADV(4);
 
-    
-    /* Location updating / registration accept: use Type-3/4 elements to extract GSSI/CCK/auth result */
-    if (pdu_type == 0x5 /* D-LOC-UPD-ACC */) {
-        /* Extract Type-3/4 elements from this PDU */
-        mm_scan_type34_elements(issi, la, mm_bits, mm_len_bits,
-                                &gssi, &have_gssi,
-                                &cck_id, &have_cck,
-                                &auth_ok, &have_auth);
+    /* We only pretty-log the "registration/authentication accepted" style lines for
+       D-LOC-UPD-ACC (0x5). This is where SDR-TETRA prints GSSI/CCK/roaming flags. */
+    if (pdu_type != 0x5) {
+#undef HAVE
+#undef GET
+#undef ADV
+        return;
+    }
 
-        if (have_auth) {
-            mm_logf_ctx(issi, la,
-                "BS result to MS authentication: %s SSI: %u - %s",
-                auth_ok ? "Authentication successful or no authentication currently in progress"
-                        : "Authentication failed or rejected",
-                issi,
-                auth_ok ? "Authentication successful or no authentication currently in progress"
-                        : "Authentication failed or rejected");
+    uint32_t gssi = 0;
+    uint8_t  have_gssi = 0;
+    uint8_t  cck_id = 0;
+    uint8_t  have_cck = 0;
+    uint8_t  auth_ok = 0;
+    uint8_t  have_auth = 0;
+    uint8_t  roam_lu = 0;
+    uint8_t  have_roam_lu = 0;
+    uint8_t  itsi_attach = 0;
+    uint8_t  have_itsi_attach = 0;
+
+    mm_scan_type34_elements(mm_bits, mm_len_bits, 4,
+                           &gssi, &have_gssi,
+                           &cck_id, &have_cck,
+                           &auth_ok, &have_auth,
+                           &roam_lu, &have_roam_lu,
+                           &itsi_attach, &have_itsi_attach);
+
+    /* "BS result ..." */
+    if (have_auth) {
+        mm_logf_ctx(issi, la,
+            "BS result to MS authentication: %s SSI: %u - %s",
+            auth_ok ? "Authentication successful or no authentication currently in progress"
+                    : "Authentication failed or rejected",
+            issi,
+            auth_ok ? "Authentication successful or no authentication currently in progress"
+                    : "Authentication failed or rejected");
+    }
+
+    /* "MS request ..." (only when auth_ok=true, to avoid garbage hits) */
+    if (have_auth && auth_ok) {
+        char tail[192];
+        tail[0] = 0;
+
+        if (have_cck) {
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), " - CCK_identifier: %u", (unsigned)cck_id);
+            strncat(tail, tmp, sizeof(tail) - strlen(tail) - 1);
+        }
+
+        if (have_roam_lu && roam_lu) {
+            strncat(tail, " - Roaming location updating", sizeof(tail) - strlen(tail) - 1);
+        } else if (have_itsi_attach && itsi_attach) {
+            strncat(tail, " - ITSI attach", sizeof(tail) - strlen(tail) - 1);
         }
 
         if (have_gssi) {
-            char extra[192];
-            extra[0] = 0;
-
-            /* Mirror SDR-Tetra's wording for the common case */
-            if (have_auth) {
-                strncat(extra, auth_ok
-                    ? " - Authentication successful or no authentication currently in progress"
-                    : " - Authentication failed or rejected",
-                    sizeof(extra) - strlen(extra) - 1);
-            }
-            if (have_cck) {
-                char tmp[64];
-                snprintf(tmp, sizeof(tmp), " - CCK_identifier: %u", (unsigned)cck_id);
-                strncat(extra, tmp, sizeof(extra) - strlen(extra) - 1);
-            }
-
-            /* In these logs this typically indicates roaming location updating */
-            strncat(extra, " - Roaming location updating", sizeof(extra) - strlen(extra) - 1);
-
             mm_logf_ctx(issi, la,
-                "MS request for registration/authentication ACCEPTED for SSI: %u GSSI: %u%s",
-                issi, gssi, extra);
-        }
-
-        return;
-    }
-
-    /* Location updating processing is noisy and usually not shown in SDR-Tetra logs */
-    if (pdu_type == 0x9 /* D-LOC-UPD-PROC */) {
-        return;
-    }
-
-/* Try to extract common Type-34 elements from *any* MM PDU. This is what
-     * makes us match SDR-Tetra better on networks that carry auth-result / GSSI
-     * in D-LOC-UPD-PROC (0x9) rather than only D-LOC-UPD-ACC (0x5).
-     */
-    int type34_emitted = 0;
-    {
-        uint32_t gssi = 0;
-        uint8_t  have_gssi = 0;
-        uint8_t  cck_id = 0;
-        uint8_t  have_cck = 0;
-        uint8_t  auth_ok = 0;
-        uint8_t  have_auth = 0;
-
-        mm_scan_type34_elements(issi, la, mm_bits, mm_len_bits,
-                               &gssi, &have_gssi, &cck_id, &have_cck,
-                               &auth_ok, &have_auth);
-        type34_emitted = (have_auth || have_gssi || have_cck);
-    }
-
-    /* If this is a location-update related PDU and we already managed to
-     * print SDR-Tetra-like lines from Type-34 elements, don't spam an
-     * extra "unparsed" line.
-     */
-    if (type34_emitted && (pdu_type == 0x5 || pdu_type == 0x9)) {
-        goto out;
-    }
-
-    /* D-AUTHENTICATION (0x1) */
-    if (pdu_type == 0x1) {
-        if (!HAVE(2)) {
-            mm_logf_ctx(issi, la, "MM too short (%u bits), skip", mm_len_bits);
-            goto out;
-        }
-        uint8_t sub = (uint8_t)GET(2);
-        ADV(2);
-
-        if (sub == 0x0) {
-            mm_logf_ctx(issi, la, "Status: Authenticatie vereist (%s)", mm_auth_subtype_str(sub));
-        } else if (sub == 0x3) {
-            mm_logf_ctx(issi, la, "%s", mm_auth_subtype_str(sub));
+                "MS request for registration/authentication ACCEPTED for SSI: %u GSSI: %u - Authentication successful or no authentication currently in progress%s",
+                issi, gssi, tail);
         } else {
-            mm_logf_ctx(issi, la, "D-AUTH subtype=%u (%s)", sub, mm_auth_subtype_str(sub));
+            mm_logf_ctx(issi, la,
+                "MS request for registration/authentication ACCEPTED for SSI: %u - Authentication successful or no authentication currently in progress%s",
+                issi, tail);
         }
-        goto out;
     }
 
-    /* D-CK-CHG-DEM (0x2) — extract CCK_identifier when present (tetra-kit compatible) */
-    if (pdu_type == 0x2) {
-        if (!HAVE(1 + 2 + 3)) {
-            mm_logf_ctx(issi, la, "MM type=0x2 (D-CK-CHG-DEM) too short (%u bits), skip", mm_len_bits);
-            goto out;
-        }
-        uint8_t ack = (uint8_t)GET(1); ADV(1);
-        uint8_t cs  = (uint8_t)GET(2); ADV(2);
-        uint8_t kct = (uint8_t)GET(3); ADV(3);
-
-        if ((kct == 1 || kct == 3) && HAVE(16)) {
-            uint16_t cck = (uint16_t)GET(16);
-            mm_logf_ctx(issi, la, "CCK_identifier: %u (D-CK-CHG-DEM ack=%u class=%u kct=%u)", cck, ack, cs, kct);
-        } else {
-            mm_logf_ctx(issi, la, "D-CK-CHG-DEM ack=%u class=%u kct=%u", ack, cs, kct);
-        }
-        goto out;
-    }
-
-    /* D-LOC-UPD-ACC (0x5) — keep the legacy accept_type decode, but the
-     * detailed auth/GSSI/CCK logging is handled by mm_scan_type34_elements().
-     */
-    if (pdu_type == 0x5) {
-        if (!HAVE(3)) {
-            mm_logf_ctx(issi, la, "MM type=0x5 (D-LOC-UPD-ACC) too short (%u bits), skip", mm_len_bits);
-            goto out;
-        }
-        uint8_t accept_type = (uint8_t)GET(3);
-        ADV(3);
-
-        /* Optional fields (mostly skipped) */
-        uint8_t o = HAVE(1) ? (uint8_t)GET(1) : 0; ADV(1);
-        if (o && HAVE(24)) ADV(24);        /* SSI */
-        uint8_t p = HAVE(1) ? (uint8_t)GET(1) : 0; ADV(1);
-        if (p && HAVE(24)) ADV(24);        /* address extension */
-        uint8_t q = HAVE(1) ? (uint8_t)GET(1) : 0; ADV(1);
-        if (q && HAVE(4))  ADV(4);         /* subscriber class */
-        uint8_t r = HAVE(1) ? (uint8_t)GET(1) : 0; ADV(1);
-        if (r && HAVE(1))  ADV(1);         /* energy saving mode */
-        uint8_t t = HAVE(1) ? (uint8_t)GET(1) : 0; ADV(1);
-        if (t && HAVE(3))  ADV(3);         /* SCCH info */
-
-        uint8_t m = HAVE(1) ? (uint8_t)GET(1) : 0; ADV(1);
-
-        (void)m; /* Type-34 parsing handled by mm_scan_type34_elements */
-        mm_logf_ctx(issi, la, "D-LOC-UPD-ACC (accept_type=%u)", accept_type);
-        goto out;
-    }
-
-    /* Fallback */
-    mm_logf_ctx(issi, la, "MM type=0x%X (unparsed) len=%u bits", pdu_type, mm_len_bits);
-
-out: ; /* MSVC: a label must precede a statement (empty statement is fine) */
 #undef HAVE
 #undef GET
 #undef ADV
@@ -466,7 +348,8 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
             unsigned int o = 4;
             for (unsigned int bi = mm_payload_off; bi < len; bi++)
                 mm_bits[o++] = (buf[bi] & 1u);
-	            const char *mm_short = tetra_get_mm_pdut_name(pdu_type, 0);
+	            const char *mm_short = NULL;
+	            mm_short = tetra_get_mm_pdut_name(pdu_type, 0);
 	            mm_logf_ctx(issi, la, "MM type=0x%X (%s) [bits]",
 	                        (unsigned)pdu_type,
 	                        mm_short ? mm_short : "D-UNKNOWN");
@@ -587,4 +470,3 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
 
     return (int)len;
 }
-
