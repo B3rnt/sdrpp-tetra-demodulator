@@ -23,6 +23,92 @@ static const char *mm_auth_subtype_str(uint8_t st) {
     }
 }
 
+/*
+ * Some MM PDUs (notably D-LOC-UPD-ACC / D-LOC-UPD-PROC) carry so-called
+ * "Type-34" elements. Different networks/PDUs place these at slightly
+ * different offsets; to be robust we scan the bitstream for known element
+ * headers instead of relying on a single fixed layout.
+ *
+ * Element header: elementType (2 bits) + elementId (4 bits)
+ * We care about (elementType==3):
+ *   - eid 0x5 : Group identity location accept (GSSI list)
+ *   - eid 0x6 : CCK information (CCK_identifier)
+ *   - eid 0xA : Authentication downlink (auth result)
+ */
+static void mm_scan_type34_elements(uint32_t issi, uint32_t la,
+                                   const uint8_t *mm_bits, unsigned mm_len_bits,
+                                   uint32_t *out_gssi, uint8_t *out_have_gssi,
+                                   uint8_t *out_cck_id, uint8_t *out_have_cck,
+                                   uint8_t *out_auth_ok, uint8_t *out_have_auth)
+{
+    if (!mm_bits || mm_len_bits < 16) return;
+
+    /* patterns are 6-bit headers: et(2)=3 => '11' + eid(4) */
+    const uint32_t HDR_GSSI = 0b110101; /* et=3,eid=0x5 */
+    const uint32_t HDR_CCK  = 0b110110; /* et=3,eid=0x6 */
+    const uint32_t HDR_AUTH = 0b111010; /* et=3,eid=0xA */
+
+    /* scan all possible start positions; header is 6 bits */
+    for (unsigned p = 0; p + 6u <= mm_len_bits; p++) {
+        uint32_t hdr = bits_to_uint(mm_bits + p, 6);
+        if (hdr == HDR_GSSI) {
+            unsigned pos = p + 6u;
+            if (pos + 3u > mm_len_bits) continue;
+            uint8_t ngrp = (uint8_t)bits_to_uint(mm_bits + pos, 3); pos += 3u;
+            for (uint8_t i = 0; i < ngrp; i++) {
+                if (pos + 2u + 24u > mm_len_bits) break;
+                uint8_t addr_type = (uint8_t)bits_to_uint(mm_bits + pos, 2); pos += 2u;
+                uint32_t g = bits_to_uint(mm_bits + pos, 24); pos += 24u;
+                if (out_gssi && out_have_gssi && !*out_have_gssi) {
+                    *out_gssi = g;
+                    *out_have_gssi = 1;
+                }
+                /* address extension present when addr_type==1 */
+                if (addr_type == 0x1 && pos + 24u <= mm_len_bits) pos += 24u;
+            }
+        } else if (hdr == HDR_CCK) {
+            /* Very common layout: ncck(3) then first CCK_identifier(8).
+             * Some variants have more data; we only need the ID.
+             */
+            unsigned pos = p + 6u;
+            if (pos + 3u + 8u > mm_len_bits) continue;
+            uint8_t ncck = (uint8_t)bits_to_uint(mm_bits + pos, 3); pos += 3u;
+            if (ncck >= 1) {
+                uint8_t cck = (uint8_t)bits_to_uint(mm_bits + pos, 8);
+                if (out_cck_id && out_have_cck) {
+                    *out_cck_id = cck;
+                    *out_have_cck = 1;
+                }
+            }
+        } else if (hdr == HDR_AUTH) {
+            unsigned pos = p + 6u;
+            if (pos + 3u > mm_len_bits) continue;
+            uint8_t auth_ok = (uint8_t)bits_to_uint(mm_bits + pos, 1);
+            if (out_auth_ok && out_have_auth) {
+                *out_auth_ok = auth_ok;
+                *out_have_auth = 1;
+            }
+        }
+    }
+
+    /* Emit SDR-Tetra-like lines when we have enough info */
+    if (out_have_auth && *out_have_auth) {
+        if (*out_auth_ok) {
+            mm_logf_ctx(issi, la, "BS result to MS authentication: Authentication successful or no authentication currently in progress SSI: %u - Authentication successful or no authentication currently in progress", issi);
+        } else {
+            mm_logf_ctx(issi, la, "BS result to MS authentication: Authentication failed or rejected SSI: %u", issi);
+        }
+    }
+
+    if (out_have_gssi && *out_have_gssi) {
+        if (out_have_cck && *out_have_cck) {
+            mm_logf_ctx(issi, la, "MS request for registration/authentication ACCEPTED for SSI: %u GSSI: %u - Authentication successful or no authentication currently in progress - CCK_identifier: %u - Roaming location updating", issi, *out_gssi, *out_cck_id);
+        } else {
+            mm_logf_ctx(issi, la, "MS request for registration/authentication ACCEPTED for SSI: %u GSSI: %u", issi, *out_gssi);
+        }
+    }
+}
+
 static void mm_try_pretty_log(uint32_t issi, uint32_t la, const uint8_t *mm_bits, unsigned int mm_len_bits)
 {
     if (!mm_bits || mm_len_bits < 4)
@@ -35,6 +121,33 @@ static void mm_try_pretty_log(uint32_t issi, uint32_t la, const uint8_t *mm_bits
 
     uint8_t pdu_type = (uint8_t)GET(4);
     ADV(4);
+
+    /* Try to extract common Type-34 elements from *any* MM PDU. This is what
+     * makes us match SDR-Tetra better on networks that carry auth-result / GSSI
+     * in D-LOC-UPD-PROC (0x9) rather than only D-LOC-UPD-ACC (0x5).
+     */
+    int type34_emitted = 0;
+    {
+        uint32_t gssi = 0;
+        uint8_t  have_gssi = 0;
+        uint8_t  cck_id = 0;
+        uint8_t  have_cck = 0;
+        uint8_t  auth_ok = 0;
+        uint8_t  have_auth = 0;
+
+        mm_scan_type34_elements(issi, la, mm_bits, mm_len_bits,
+                               &gssi, &have_gssi, &cck_id, &have_cck,
+                               &auth_ok, &have_auth);
+        type34_emitted = (have_auth || have_gssi || have_cck);
+    }
+
+    /* If this is a location-update related PDU and we already managed to
+     * print SDR-Tetra-like lines from Type-34 elements, don't spam an
+     * extra "unparsed" line.
+     */
+    if (type34_emitted && (pdu_type == 0x5 || pdu_type == 0x9)) {
+        goto out;
+    }
 
     /* D-AUTHENTICATION (0x1) */
     if (pdu_type == 0x1) {
@@ -74,7 +187,9 @@ static void mm_try_pretty_log(uint32_t issi, uint32_t la, const uint8_t *mm_bits
         goto out;
     }
 
-    /* D-LOC-UPD-ACC (0x5) — best-effort extraction of GSSI and auth result from Type-34 elements */
+    /* D-LOC-UPD-ACC (0x5) — keep the legacy accept_type decode, but the
+     * detailed auth/GSSI/CCK logging is handled by mm_scan_type34_elements().
+     */
     if (pdu_type == 0x5) {
         if (!HAVE(3)) {
             mm_logf_ctx(issi, la, "MM type=0x5 (D-LOC-UPD-ACC) too short (%u bits), skip", mm_len_bits);
@@ -97,53 +212,8 @@ static void mm_try_pretty_log(uint32_t issi, uint32_t la, const uint8_t *mm_bits
 
         uint8_t m = HAVE(1) ? (uint8_t)GET(1) : 0; ADV(1);
 
-        uint32_t gssi = 0;
-        uint8_t  have_gssi = 0;
-
-        if (m) {
-            /* Type-34 elements: (elementType:2, elementId:4, ...).
-             * Implement:
-             * - (et=3,eid=0x5) Group identity location accept (extract first group identity as GSSI)
-             * - (et=3,eid=0xA) Authentication downlink (emit auth_ok)
-             *
-             * Stop on unknown element (no safe length to skip).
-             */
-            while (HAVE(6)) {
-                uint8_t et  = (uint8_t)GET(2); ADV(2);
-                uint8_t eid = (uint8_t)GET(4); ADV(4);
-
-                if (et != 3) break;
-
-                if (eid == 0x5) {
-                    if (!HAVE(3)) break;
-                    uint8_t ngrp = (uint8_t)GET(3); ADV(3);
-
-                    for (uint8_t i = 0; i < ngrp; i++) {
-                        if (!HAVE(2 + 24)) break;
-                        uint8_t addr_type = (uint8_t)GET(2); ADV(2);
-                        uint32_t g = GET(24); ADV(24);
-                        if (!have_gssi) { gssi = g; have_gssi = 1; }
-                        if (addr_type == 0x1 && HAVE(24)) ADV(24); /* address extension */
-                    }
-                } else if (eid == 0xA) {
-                    if (!HAVE(3)) break;
-                    uint8_t auth_ok = (uint8_t)GET(1); ADV(1);
-                    ADV(1); /* supply TEI */
-                    ADV(1); /* ck provisioning flag (not parsed here yet) */
-                    if (auth_ok) {
-                        mm_logf_ctx(issi, la, "BS result to MS authentication: Authentication successful or no authentication currently in progress");
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
-
-        if (have_gssi) {
-            mm_logf_ctx(issi, la, "MS request for registration ACCEPTED for SSI: %u GSSI: %u (accept_type=%u)", issi, gssi, accept_type);
-        } else {
-            mm_logf_ctx(issi, la, "D-LOC-UPD-ACC (accept_type=%u)", accept_type);
-        }
+        (void)m; /* Type-34 parsing handled by mm_scan_type34_elements */
+        mm_logf_ctx(issi, la, "D-LOC-UPD-ACC (accept_type=%u)", accept_type);
         goto out;
     }
 
