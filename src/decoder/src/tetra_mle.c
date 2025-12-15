@@ -119,6 +119,14 @@ static void mm_try_pretty_log(uint32_t issi, uint32_t la, const uint8_t *mm_bits
 #define GET(N)  (HAVE(N) ? bits_to_uint(mm_bits + pos, (N)) : 0)
 #define ADV(N)  do { pos += (N); } while (0)
 
+	/* Optional fields parsed from Type-3/4 elements (kept local; not all PDUs include them) */
+	uint32_t gssi = 0;
+	uint32_t cck_id = 0;
+	int have_gssi = 0;
+	int have_cck = 0;
+	int auth_ok = 0;
+	int have_auth = 0;
+
     uint8_t pdu_type = (uint8_t)GET(4);
     ADV(4);
 
@@ -386,19 +394,20 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
             break;
         }
 
-        if (!found) {
-            char dump[256]; dump[0] = '\0';
-            unsigned int n = (len > 32) ? 32 : len;
-            for (unsigned int i = 0; i < n; i++) {
-                char tmp[4];
-                snprintf(tmp, sizeof(tmp), "%u", (unsigned)(buf[i] & 1u));
-                strncat(dump, tmp, sizeof(dump) - strlen(dump) - 1);
-            }
-#ifdef TETRA_VERBOSE_MLE
-            mm_logf_ctx(issi, la, "MLE PDISC=0 reserved/unknown, bits[0..%u]=%s",
-                        n ? (n - 1) : 0, dump);
-            return (int)len;
-        }
+	    if (!found) {
+	        char dump[256]; dump[0] = '\0';
+	        unsigned int n = (len > 32) ? 32 : len;
+	        for (unsigned int i = 0; i < n; i++) {
+	            char tmp[4];
+	            snprintf(tmp, sizeof(tmp), "%u", (unsigned)(buf[i] & 1u));
+	            strncat(dump, tmp, sizeof(dump) - strlen(dump) - 1);
+	        }
+	#ifdef TETRA_VERBOSE_MLE
+	        mm_logf_ctx(issi, la, "MLE PDISC=%u reserved/unknown, bits[0..%u]=%s",
+	                    (unsigned)mle_pdisc, n ? (n - 1) : 0, dump);
+	#endif
+	        return (int)len;
+	    }
 
         if (pdisc_off != 0) {
             mm_logf_ctx(issi, la, "MLE bit-align shift=%u", pdisc_off);
@@ -419,8 +428,9 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
 #ifdef TETRA_VERBOSE_MLE
             mm_logf_ctx(issi, la, "MLE PDISC=%u reserved/unknown, bits[0..%u]=%s",
                         (unsigned)mle_pdisc, n ? (n - 1) : 0, dump);
-            return (int)len;
-        }
+	#endif
+		return (int)len;
+	}
 
 /* MM: next 4 bits are the MM PDU type (message type) */
         if (mle_pdisc == TMLE_PDISC_MM) {
