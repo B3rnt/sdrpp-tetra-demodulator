@@ -21,29 +21,89 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+// #include <unistd.h>
 
-#include <osmocom/core/utils.h>
-#include <osmocom/core/msgb.h>
-#include <osmocom/core/talloc.h>
+// #include <osmocom/core/utils.h>
+// #include <osmocom/core/msgb.h>
+// #include <osmocom/core/talloc.h>
 
 #include "crypto/tetra_crypto.h"
 #include "tetra_common.h"
 #include "tetra_prim.h"
 #include "tetra_upper_mac.h"
 #include "tetra_mac_pdu.h"
-#include "tetra_llc_pdu.h"
-#include "tetra_llc.h"
-#include "tetra_gsmtap.h"
+// #include "tetra_llc_pdu.h"
+// #include "tetra_llc.h"
+
+/* >>> ADDED: for MLE/MM bypass logging */
+#include "tetra_mle.h"   /* rx_tl_sdu() */
+#include "mm_log.h"      /* mm_log() */
+/* <<< ADDED */
 
 /* FIXME move global fragslots to context variable */
-struct fragslot fragslots[FRAGSLOT_NR_SLOTS] = {0};
+// struct fragslot fragslots[FRAGSLOT_NR_SLOTS] = {0};
+
+/* ---------------------------------------------------------
+ * DEBUG BYPASS: stuur L2 payload direct naar MLE (TL-SDU)
+ * Hiermee krijg je PDISC/MM output zonder LLC te fixen.
+ * --------------------------------------------------------- */
+static void try_decode_to_mle(struct tetra_mac_state *tms, struct msgb *msg)
+{
+    if (!tms || !msg || !msg->l2h)
+        return;
+
+    unsigned int l2len = (unsigned int)msgb_l2len(msg);
+    if (l2len == 0)
+        return;
+
+    /* Meestal zitten MM/CMCE op control signalling.
+       Op traffic bursts decode je meestal niets nuttigs, behalve “stolen” blocks. */
+    if (tms->cur_burst.is_traffic &&
+        !tms->cur_burst.blk1_stolen &&
+        !tms->cur_burst.blk2_stolen) {
+        return;
+    }
+
+    /* Bypass LLC: behandel l2h alsof dit TL-SDU is */
+    msg->l3h = msg->l2h;
+
+    /* --- ADDED: log PDISC + ISSI/SSI context --- */
+    if (l2len >= 1) {
+        uint8_t pdisc;
+        /* l3h is usually unpacked bits (0/1) in this chain. */
+        int unpacked = 1;
+        for (unsigned int i = 0; i < l2len; i++) { if (msg->l3h[i] > 1) { unpacked = 0; break; } }
+        if (unpacked && l2len >= 3) pdisc = (uint8_t)bits_to_uint(msg->l3h, 3);
+        else pdisc = msg->l3h[0] & 0x0F;
+
+        if (pdisc == 1) { /* MM */
+            char buf[256];
+
+            if (tms->addr_type != ADDR_TYPE_NULL && tms->ssi != 0) {
+                snprintf(buf, sizeof(buf),
+                         "MLE PDISC=1 (MM) ISSI=%u (0x%06X) addr_type=%u usage=%u",
+                         (unsigned)tms->ssi, (unsigned)tms->ssi,
+                         (unsigned)tms->addr_type, (unsigned)tms->usage_marker);
+            } else {
+                snprintf(buf, sizeof(buf),
+                         "MLE PDISC=1 (MM) ISSI=UNKNOWN addr_type=%u usage=%u",
+                         (unsigned)tms->addr_type, (unsigned)tms->usage_marker);
+            }
+
+            mm_log(buf);
+        }
+    }
+    /* --- END ADDED --- */
+
+    (void)rx_tl_sdu(tms, msg, l2len);
+}
 
 void init_fragslot(struct fragslot *fragslot)
 {
 	if (fragslot->msgb) {
 		/* Should never be the case, but just to be sure */
-		talloc_free(fragslot->msgb);
+		// talloc_free(fragslot->msgb);
+		free(fragslot->msgb);
 		memset(fragslot, 0, sizeof(struct fragslot));
 	}
 	fragslot->msgb = msgb_alloc(FRAGSLOT_MSGB_SIZE, "fragslot");
@@ -52,20 +112,21 @@ void init_fragslot(struct fragslot *fragslot)
 void cleanup_fragslot(struct fragslot *fragslot)
 {
 	if (fragslot->msgb) {
-		talloc_free(fragslot->msgb);
+		// talloc_free(fragslot->msgb);
+		free(fragslot->msgb);
 	}
 	memset(fragslot, 0, sizeof(struct fragslot));
 }
 
-void age_fragslots()
+void age_fragslots(struct tetra_mac_state *tms)
 {
 	int i;
 	for (i = 0; i < FRAGSLOT_NR_SLOTS; i++) {
-		if (fragslots[i].active) {
-			fragslots[i].age++;
-			if (fragslots[i].age > N203) {
-				printf("\nFRAG: aged out old fragments for slot=%d fragments=%d length=%d timer=%d\n", i, fragslots[i].num_frags, fragslots[i].length, fragslots[i].age);
-				cleanup_fragslot(&fragslots[i]);
+		if (tms->fragslots[i].active) {
+			tms->fragslots[i].age++;
+			if (tms->fragslots[i].age > N203) {
+				// printf("\nFRAG: aged out old fragments for slot=%d fragments=%d length=%d timer=%d\n", i, tms->fragslots[i].num_frags, tms->fragslots[i].length, tms->fragslots[i].age);
+				cleanup_fragslot(&tms->fragslots[i]);
 			}
 		}
 	}
@@ -78,7 +139,7 @@ static int get_num_fill_bits(const unsigned char *l1h, int len_with_fillbits)
 			return i;
 		}
 	}
-	printf("WARNING get_fill_bits_len: no 1 bit within %d bytes from end\n", len_with_fillbits);
+	// printf("WARNING get_fill_bits_len: no 1 bit within %d bytes from end\n", len_with_fillbits);
 	return 0;
 }
 
@@ -104,16 +165,56 @@ static int rx_bcast(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
 				      sid.duplex_spacing,
 				      sid.reverse_operation);
 
-	printf("BNCH SYSINFO (DL %u Hz, UL %u Hz), service_details 0x%04x ",
-		dl_freq, ul_freq, sid.mle_si.bs_service_details);
-	if (sid.cck_valid_no_hf)
-		printf("CCK ID %u", sid.cck_id);
-	else
-		printf("Hyperframe %u", sid.hyperframe_number);
-	printf("\n");
-	for (i = 0; i < 12; i++)
-		printf("\t%s: %u\n", tetra_get_bs_serv_det_name(1 << i),
-			sid.mle_si.bs_service_details & (1 << i) ? 1 : 0);
+	// printf("BNCH SYSINFO (DL %u Hz, UL %u Hz), service_details 0x%04x ",
+		// dl_freq, ul_freq, sid.mle_si.bs_service_details);
+	tms->t_display_st->dl_freq = dl_freq;
+	tms->t_display_st->ul_freq = ul_freq;
+	if (sid.cck_valid_no_hf) {
+		// printf("CCK ID %u", sid.cck_id);
+	} else {
+		// printf("Hyperframe %u", sid.hyperframe_number);
+		tms->t_display_st->curr_hyperframe = sid.hyperframe_number;
+	}
+	// printf("\n");
+	for (i = 0; i < 12; i++) {
+		// printf("\t%s: %u\n", tetra_get_bs_serv_det_name(1 << i),
+			// sid.mle_si.bs_service_details & (1 << i) ? 1 : 0);
+			switch(i) {
+				case 0:
+					tms->t_display_st->advanced_link = (sid.mle_si.bs_service_details & (1 << i) ? 1 : 0);
+					break;
+				case 1:
+					tms->t_display_st->air_encryption = (sid.mle_si.bs_service_details & (1 << i) ? 1 : 0);
+					break;
+				case 2:
+					tms->t_display_st->sndcp_data = (sid.mle_si.bs_service_details & (1 << i) ? 1 : 0);
+					break;
+				case 4:
+					tms->t_display_st->circuit_data = (sid.mle_si.bs_service_details & (1 << i) ? 1 : 0);
+					break;
+				case 5:
+					tms->t_display_st->voice_service = (sid.mle_si.bs_service_details & (1 << i) ? 1 : 0);
+					break;
+				case 6:
+					tms->t_display_st->normal_mode = (sid.mle_si.bs_service_details & (1 << i) ? 1 : 0);
+					break;
+				case 7:
+					tms->t_display_st->migration_supported = (sid.mle_si.bs_service_details & (1 << i) ? 1 : 0);
+					break;
+				case 8:
+					tms->t_display_st->never_minimum_mode = (sid.mle_si.bs_service_details & (1 << i) ? 1 : 0);
+					break;
+				case 9:
+					tms->t_display_st->priority_cell = (sid.mle_si.bs_service_details & (1 << i) ? 1 : 0);
+					break;
+				case 10:
+					tms->t_display_st->dereg_mandatory = (sid.mle_si.bs_service_details & (1 << i) ? 1 : 0);
+					break;
+				case 11:
+					tms->t_display_st->reg_mandatory = (sid.mle_si.bs_service_details & (1 << i) ? 1 : 0);
+					break;
+			}
+	}
 
 	memcpy(&tms->last_sid, &sid, sizeof(sid));
 
@@ -175,14 +276,14 @@ static int rx_resrc(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
 	} else {
 		pdu_bits = rsd.macpdu_length * 8;	/* Length given */
 		msg->tail = msg->head + pdu_bits;
-		msg->len = msg->tail - msg->head;
+		msg->len = (uint16_t)(msg->tail - msg->head);
 	}
 
 	/* Strip fill bits */
 	if (rsd.fill_bits) {
 		int num_fill_bits = get_num_fill_bits(msg->l1h, msgb_l1len(msg));
 		msg->tail -= num_fill_bits;
-		msg->len = msg->tail - msg->head;
+		msg->len = (uint16_t)(msg->tail - msg->head);
 	}
 
 	/* Decrypt buffer if encrypted and key available */
@@ -201,22 +302,6 @@ static int rx_resrc(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
 
 	/* We now have accurate length and start of TM-SDU, set LLC start in msg->l2h */
 	msg->l2h = msg->l1h + tmpdu_offset;
-	printf("RESOURCE Encr=%u%s len_field=%d l1_len=%d l2_len=%d Addr=%s",
-		rsd.encryption_mode,
-		rsd.encryption_mode && !rsd.is_encrypted ? " DECRYPTED" : "",
-		rsd.macpdu_length, msgb_l1len(msg), msgb_l2len(msg),
-		tetra_addr_dump(&rsd.addr));
-
-	if (rsd.chan_alloc_pres) {
-		if (!rsd.is_encrypted)
-			printf(" ChanAlloc=%s", tetra_alloc_dump(&rsd.cad, tms));
-		else
-			printf(" ChanAlloc=ENCRYPTED");
-	}
-
-	if (rsd.slot_granting.pres)
-		printf(" SlotGrant=%u/%u", rsd.slot_granting.nr_slots,
-			rsd.slot_granting.delay);
 
 	if (rsd.addr.type == ADDR_TYPE_NULL) {
 		pdu_bits = -1; /* No more PDUs in slot */
@@ -232,55 +317,54 @@ static int rx_resrc(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
 	if (rsd.is_encrypted)
 		goto out; /* Can't parse any further */
 
-	printf(": %s\n", osmo_ubit_dump(msg->l2h, msgb_l2len(msg)));
+	// printf(": %s\n", osmo_ubit_dump(msg->l2h, msgb_l2len(msg)));
 	if (rsd.macpdu_length != MACPDU_LEN_START_FRAG || !REASSEMBLE_FRAGMENTS) {
 		/* Non-fragmented resource (or no reassembly desired) */
-		rx_tm_sdu(tms, msg, msgb_l2len(msg));
+		/* >>> ADDED: bypass LLC and feed directly into MLE/TL-SDU decoder */
+		try_decode_to_mle(tms, msg);
+		/* <<< ADDED */
 	} else {
 		/* Fragmented resource */
 		slot = tmvp->u.unitdata.tdma_time.tn;
-		if (fragslots[slot].active) {
-			printf("\nWARNING: fragment slot still active\n");
-			cleanup_fragslot(&fragslots[slot]);
+		if (tms->fragslots[slot].active) {
+			// printf("\nWARNING: fragment slot still active\n");
+			cleanup_fragslot(&tms->fragslots[slot]);
 		}
 
-		init_fragslot(&fragslots[slot]);
-		fragmsgb = fragslots[slot].msgb;
+		init_fragslot(&tms->fragslots[slot]);
+		fragmsgb = tms->fragslots[slot].msgb;
 
 		/* Copy l2 part to fragmsgb. l3h is constructed once all fragments are merged */
-		fragmsgb = fragslots[slot].msgb;
+		fragmsgb = tms->fragslots[slot].msgb;
 		fragmsgb->l1h = msgb_put(fragmsgb, msgb_l1len(msg));
 		fragmsgb->l2h = fragmsgb->l1h + tmpdu_offset;
 		fragmsgb->l3h = 0;
 		memcpy(fragmsgb->l2h, msg->l2h, msgb_l2len(msg));
 
-		printf("\nFRAG-START slot=%d len=%d msgb=%s\n", slot, msgb_l2len(fragmsgb), osmo_ubit_dump(fragmsgb->l2h, msgb_l2len(msg)));
-		fragslots[slot].active = 1;
-		fragslots[slot].num_frags = 1;
-		fragslots[slot].length = msgb_l2len(msg);
-		fragslots[slot].encryption = rsd.encryption_mode > 0;
-		fragslots[slot].key = key;
+		tms->fragslots[slot].active = 1;
+		tms->fragslots[slot].num_frags = 1;
+		tms->fragslots[slot].length = msgb_l2len(msg);
+		tms->fragslots[slot].encryption = rsd.encryption_mode > 0;
+		tms->fragslots[slot].key = key;
 	}
 
 out:
-	printf("\n");
 	return pdu_bits;
 }
 
-void append_frag_bits(int slot, uint8_t *bits, int bitlen)
+void append_frag_bits(struct tetra_mac_state *tms, int slot, uint8_t *bits, int bitlen)
 {
 	struct msgb *fragmsgb;
-	fragmsgb = fragslots[slot].msgb;
+	fragmsgb = tms->fragslots[slot].msgb;
 	if (fragmsgb->len + bitlen > fragmsgb->data_len) {
-		printf(" WARNING: FRAG LENGTH ERROR!\n");
 		return;
 	}
 	unsigned char *append_ptr = msgb_put(fragmsgb, bitlen);
 	memcpy(append_ptr, bits, bitlen);
 
-	fragslots[slot].length = fragslots[slot].length + bitlen;
-	fragslots[slot].num_frags++;
-	fragslots[slot].age = 0;
+	tms->fragslots[slot].length = tms->fragslots[slot].length + bitlen;
+	tms->fragslots[slot].num_frags++;
+	tms->fragslots[slot].age = 0;
 }
 
 static int rx_macfrag(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
@@ -293,7 +377,7 @@ static int rx_macfrag(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tm
 	int n = 0;
 	int m = 0;
 
-	if (fragslots[slot].active) {
+	if (tms->fragslots[slot].active) {
 		m = 2; n = n + m; /*  MAC-FRAG/END (01) */
 		m = 1; n = n + m; /*  MAC-FRAG (0) */
 		m = 1; fillbits_present = bits_to_uint(bits + n, m); n = n + m;
@@ -303,19 +387,18 @@ static int rx_macfrag(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tm
 		if (fillbits_present) {
 			int num_fill_bits = get_num_fill_bits(msg->l1h, msgb_l1len(msg));
 			msg->tail -= num_fill_bits;
-			msg->len = msg->tail - msg->head;
+			msg->len = (uint16_t)(msg->tail - msg->head);
 		}
 
 		/* Decrypt (if required) */
-		fragmsgb = fragslots[slot].msgb;
-		if (fragslots[slot].encryption && fragslots[slot].key)
-			decrypt_mac_element(tms->tcs, tmvp, fragslots[slot].key, msgb_l1len(msg), n);
+		fragmsgb = tms->fragslots[slot].msgb;
+		if (tms->fragslots[slot].encryption && tms->fragslots[slot].key)
+			decrypt_mac_element(tms->tcs, tmvp, tms->fragslots[slot].key, msgb_l1len(msg), n);
 
 		/* Add frag to fragslot buffer */
-		append_frag_bits(slot, msg->l2h, msgb_l2len(msg));
-		printf("FRAG-CONT slot=%d added=%d msgb=%s\n", slot, msgb_l2len(msg), osmo_ubit_dump(fragmsgb->l2h, msgb_l2len(fragmsgb)));
+		append_frag_bits(tms, slot, msg->l2h, msgb_l2len(msg));
 	} else {
-		printf("WARNING got fragment without start packet for slot=%d\n", slot);
+		// printf("WARNING got fragment without start packet for slot=%d\n", slot);
 	}
 	return -1; /* Always fills slot */
 }
@@ -339,8 +422,8 @@ static int rx_macend(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms
 	m = 1; n = n + m; /* position_of_grant */
 	m = 6; length_indicator = bits_to_uint(bits + n, m); n = n + m;
 
-	fragmsgb = fragslots[slot].msgb;
-	if (fragslots[slot].active) {
+	fragmsgb = tms->fragslots[slot].msgb;
+	if (tms->fragslots[slot].active) {
 
 		/* FIXME: handle napping bit in d8psk and qam */
 		m = 1; slot_granting = bits_to_uint(bits + n, m); n = n + m;
@@ -352,16 +435,16 @@ static int rx_macend(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms
 
 		/* Determine msg len, strip fill bits if any */
 		msg->tail = msg->head + length_indicator * 8;
-		msg->len = msg->tail - msg->head;
+		msg->len = (uint16_t)(msg->tail - msg->head);
 		if (fillbits_present) {
 			num_fill_bits = get_num_fill_bits(msg->l1h, msgb_l1len(msg));
 			msg->tail -= num_fill_bits;
-			msg->len = msg->tail - msg->head;
+			msg->len = (uint16_t)(msg->tail - msg->head);
 		}
 
 		/* Decrypt (if required) */
-		if (fragslots[slot].encryption && fragslots[slot].key)
-			decrypt_mac_element(tms->tcs, tmvp, fragslots[slot].key, msgb_l1len(msg), n);
+		if (tms->fragslots[slot].encryption && tms->fragslots[slot].key)
+			decrypt_mac_element(tms->tcs, tmvp, tms->fragslots[slot].key, msgb_l1len(msg), n);
 
 		/* Parse chanalloc element (if present) and update l2 offsets */
 		if (chanalloc_present) {
@@ -369,21 +452,20 @@ static int rx_macend(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms
 		}
 
 		msg->l2h = msg->l1h + n;
-		append_frag_bits(slot, msg->l2h, msgb_l2len(msg));
-		printf("FRAG-END slot=%d added=%d msgb=%s\n", slot, msgb_l2len(msg), osmo_ubit_dump(fragmsgb->l2h, msgb_l2len(fragmsgb)));
+		append_frag_bits(tms, slot, msg->l2h, msgb_l2len(msg));
 
 		/* Message is completed inside fragmsgb now */
-		if (!fragslots[slot].encryption || fragslots[slot].key) {
-			rx_tm_sdu(tms, fragmsgb, fragslots[slot].length);
+		if (!tms->fragslots[slot].encryption || tms->fragslots[slot].key) {
+			/* >>> ADDED: bypass LLC and feed reassembled payload into MLE/TL-SDU decoder */
+			fragmsgb->l3h = fragmsgb->l2h;
+			try_decode_to_mle(tms, fragmsgb);
+			/* <<< ADDED */
 		}
-	} else {
-		printf("FRAG: got end frag with len %d without start packet for slot=%d\n", length_indicator * 8, slot);
 	}
 
-	cleanup_fragslot(&fragslots[slot]);
+	cleanup_fragslot(&tms->fragslots[slot]);
 	return length_indicator * 8;
 }
-
 
 static int rx_suppl(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
 {
@@ -405,19 +487,18 @@ static int rx_suppl(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
 	}
 #endif
 
-	printf("SUPPLEMENTARY MAC-D-BLOCK ");
-
-	//if (sud.encryption_mode == 0)
 	msg->l2h = msg->l1h + tmpdu_offset;
-	rx_tm_sdu(tms, msg, 100);
 
-	printf("\n");
+	/* >>> ADDED: bypass LLC and feed directly into MLE/TL-SDU decoder */
+	try_decode_to_mle(tms, msg);
+	/* <<< ADDED */
+
 	return -1; /* TODO FIXME check length */
 }
 
 static void dump_access(struct tetra_access_field *acc, unsigned int num)
 {
-	printf("ACCESS%u: %c/%u ", num, 'A'+acc->access_code, acc->base_frame_len);
+	// printf("ACCESS%u: %c/%u ", num, 'A'+acc->access_code, acc->base_frame_len);
 }
 
 static void rx_aach(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
@@ -425,20 +506,26 @@ static void rx_aach(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
 	struct tmv_unitdata_param *tup = &tmvp->u.unitdata;
 	struct tetra_acc_ass_decoded aad;
 
-	printf("ACCESS-ASSIGN PDU: ");
-
 	memset(&aad, 0, sizeof(aad));
 	macpdu_decode_access_assign(&aad, tmvp->oph.msg->l1h,
 				    tup->tdma_time.fn == 18 ? 1 : 0);
 
-	if (aad.pres & TETRA_ACC_ASS_PRES_ACCESS1)
+	if (aad.pres & TETRA_ACC_ASS_PRES_ACCESS1) {
+		tms->t_display_st->access1_code = 'A'+(aad.access[0].access_code);
+		tms->t_display_st->access1 = (aad.access[0].base_frame_len);
 		dump_access(&aad.access[0], 1);
-	if (aad.pres & TETRA_ACC_ASS_PRES_ACCESS2)
+	}
+	if (aad.pres & TETRA_ACC_ASS_PRES_ACCESS2) {
 		dump_access(&aad.access[1], 2);
-	if (aad.pres & TETRA_ACC_ASS_PRES_DL_USAGE)
-		printf("DL_USAGE: %s ", tetra_get_dl_usage_name(aad.dl_usage));
-	if (aad.pres & TETRA_ACC_ASS_PRES_UL_USAGE)
-		printf("UL_USAGE: %s ", tetra_get_ul_usage_name(aad.ul_usage));
+		tms->t_display_st->access2_code = 'A'+(aad.access[1].access_code);
+		tms->t_display_st->access2 = (aad.access[1].base_frame_len);
+	}
+	if (aad.pres & TETRA_ACC_ASS_PRES_DL_USAGE) {
+		tms->t_display_st->dl_usage = aad.dl_usage;
+	}
+	if (aad.pres & TETRA_ACC_ASS_PRES_UL_USAGE) {
+		tms->t_display_st->ul_usage = aad.ul_usage;
+	}
 
 	/* save the state whether the current burst is traffic or not */
 	if (aad.dl_usage > 3) {
@@ -450,8 +537,6 @@ static void rx_aach(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
 	/* Reset slot stealing flags */
 	tms->cur_burst.blk1_stolen = false;
 	tms->cur_burst.blk2_stolen = false;
-
-	printf("\n");
 }
 
 static int rx_tmv_unitdata_ind(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_state *tms)
@@ -460,7 +545,6 @@ static int rx_tmv_unitdata_ind(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_
 	struct msgb *msg = tmvp->oph.msg;
 	uint8_t pdu_type = bits_to_uint(msg->l1h, 2);
 	const char *pdu_name;
-	struct msgb *gsmtap_msg;
 	int len_parsed;
 
 	if (tup->lchan == TETRA_LC_BSCH)
@@ -472,28 +556,13 @@ static int rx_tmv_unitdata_ind(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_
 		pdu_name = tetra_get_macpdu_name(pdu_type);
 	}
 
-	printf("TMV-UNITDATA.ind %s %s CRC=%u %s\n",
-		tetra_tdma_time_dump(&tup->tdma_time),
-		tetra_get_lchan_name(tup->lchan),
-		tup->crc_ok, pdu_name);
-
 	if (!tup->crc_ok)
 		return -1;
 
-	gsmtap_msg = tetra_gsmtap_makemsg(&tup->tdma_time, tup->lchan,
-					  tup->tdma_time.tn-1, /* expects timeslot in 0-3 range */
-					  /* FIXME: */ 0, 0, 0,
-					msg->l1h, msgb_l1len(msg), tms);
-	if (gsmtap_msg)
-		tetra_gsmtap_sendmsg(gsmtap_msg);
-
-
 	if (tup->tdma_time.fn == 18 && REASSEMBLE_FRAGMENTS)
-		/* Age out old fragments */
-		/* FIXME: also age out old event labels */
-		age_fragslots();
+		age_fragslots(tms);
 
-	len_parsed = -1; /* Default for cases where slot is filled or otherwise irrelevant */
+	len_parsed = -1;
 	switch (tup->lchan) {
 	case TETRA_LC_AACH:
 		rx_aach(tmvp, tms);
@@ -519,27 +588,23 @@ static int rx_tmv_unitdata_ind(struct tetra_tmvsap_prim *tmvp, struct tetra_mac_
 					len_parsed = rx_macend(tmvp, tms);
 				}
 			} else {
-				len_parsed = -1; /* Can't determine len */
+				len_parsed = -1;
 				if (msg->l1h[3] == TETRA_MAC_FRAGE_FRAG) {
-					printf("FRAG/END FRAG: ");
 					msg->l2h = msg->l1h+4;
-					rx_tm_sdu(tms, msg, 100 /*FIXME*/);
-					printf("\n");
-				} else {
-					printf("FRAG/END END\n");
+					/* >>> ADDED: bypass LLC (even without reassembly) */
+					try_decode_to_mle(tms, msg);
+					/* <<< ADDED */
 				}
 			}
 			break;
 		default:
-			len_parsed = -1; /* Can't determine len */
-			printf("STRANGE pdu=%u\n", pdu_type);
+			len_parsed = -1;
 			break;
 		}
 		break;
 	case TETRA_LC_BSCH:
 		break;
 	default:
-		printf("STRANGE lchan=%u\n", tup->lchan);
 		break;
 	}
 
@@ -558,7 +623,6 @@ int upper_mac_prim_recv(struct osmo_prim_hdr *op, void *priv)
 		pdu_bits = rx_tmv_unitdata_ind(tmvp, tms);
 		break;
 	default:
-		printf("primitive on unknown sap\n");
 		break;
 	}
 

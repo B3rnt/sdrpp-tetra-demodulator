@@ -21,13 +21,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+// #include <unistd.h>
 #include <errno.h>
-#include <linux/limits.h>
+// #include <linux/limits.h>
 
-#include <osmocom/core/utils.h>
-#include <osmocom/core/msgb.h>
-#include <osmocom/core/talloc.h>
+// #include <osmocom/core/utils.h>
+// #include <osmocom/core/msgb.h>
+// #include <osmocom/core/talloc.h>
 
 #include <tetra_common.h>
 #include <tetra_tdma.h>
@@ -41,6 +41,9 @@
 #include "tetra_upper_mac.h"
 #include <lower_mac/viterbi.h>
 #include <crypto/tetra_crypto.h>
+
+#include "c-code/channel.h"
+#include "c-code/source.h"
 
 struct tetra_blk_param {
 	const char *name;
@@ -130,7 +133,9 @@ struct tetra_tmvsap_prim *tmvsap_prim_alloc(uint16_t prim, uint8_t op)
 {
 	struct tetra_tmvsap_prim *ttp;
 
-	ttp = talloc_zero(NULL, struct tetra_tmvsap_prim);
+	// ttp = talloc_zero(NULL, struct tetra_tmvsap_prim);
+	ttp = malloc(sizeof(struct tetra_tmvsap_prim));
+	memset(ttp, 0, sizeof(struct tetra_tmvsap_prim));
 	ttp->oph.msg = msgb_alloc(412, "tmvsap_prim");
 	ttp->oph.sap = TETRA_SAP_TMV;
 	ttp->oph.primitive = prim;
@@ -169,7 +174,7 @@ void tp_sap_udata_ind(enum tp_sap_data_type type, int blk_num, const uint8_t *bi
 
 	if (type == TPSAP_T_SB2 && is_bnch(&tcd->time)) {
 		tup->lchan = TETRA_LC_BNCH;
-		printf("BNCH FOLLOWS\n");
+		// printf("BNCH FOLLOWS\n");
 	}
 
 	DEBUGP("%s %s type5: %s\n", tbp->name, tetra_tdma_time_dump(&tcd->time),
@@ -194,52 +199,6 @@ void tp_sap_udata_ind(enum tp_sap_data_type type, int blk_num, const uint8_t *bi
 	if (tms->cur_burst.is_traffic && type == TPSAP_T_NDB && blk_num == BLK_1)
 		tms->cur_burst.blk1_stolen = true;
 
-	/* If this is a traffic channel, dump. */
-	if (tms->cur_burst.is_traffic && (type == TPSAP_T_SCH_F || (blk_num == BLK_2 && !tms->cur_burst.blk2_stolen))) {
-		char fname[PATH_MAX];
-		int16_t block[690];
-		FILE *f;
-		int i;
-
-		/* Open target file */
-		snprintf(fname, sizeof(fname), "%s/traffic_%d_%d.out", tms->dumpdir,
-			tms->cur_burst.is_traffic, tms->tsn);
-		f = fopen(fname, "ab");
-		if (!f) {
-			fprintf(stderr, "Could not open dump file %s for writing: %s\n", fname, strerror(errno));
-			exit(1);
-		}
-
-		/* Generate a block */
-		memset(block, 0x00, sizeof(int16_t) * 690);
-		for (i = 0; i < 6; i++)
-			block[115*i] = 0x6b21 + i;
-
-		for (i = 0; i < 114; i++)
-			block[1+i] = type4[i] ? -127 : 127;
-
-		for (i = 0; i < 114; i++)
-			block[116+i] = type4[114+i] ? -127 : 127;
-
-		for (i = 0; i < 114; i++)
-			block[231+i] = type4[228+i] ? -127 : 127;
-
-		for (i = 0; i < 90; i++)
-			block[346+i] = type4[342+i] ? -127 : 127;
-
-		/* Write it */
-		fwrite(block, sizeof(int16_t), 690, f);
-		fclose(f);
-
-		/* Write used ssi */
-		snprintf(fname, sizeof(fname), "%s/traffic_%d_%d.txt", tms->dumpdir,
-			tms->cur_burst.is_traffic, tms->tsn);
-		f = fopen(fname, "a");
-		fprintf(f, "%d\n", tms->ssi);
-		fclose(f);
-		goto out;
-	}
-
 	if (tbp->interleave_a) {
 		/* Run block deinterleaving: type-3 bits */
 		block_deinterleave(tbp->type345_bits, tbp->interleave_a, type4, type3);
@@ -257,17 +216,21 @@ void tp_sap_udata_ind(enum tp_sap_data_type type, int blk_num, const uint8_t *bi
 
 	if (tbp->have_crc16) {
 		uint16_t crc = crc16_ccitt_bits(type2, tbp->type1_bits+16);
-		printf("CRC COMP: 0x%04x ", crc);
+		// printf("CRC COMP: 0x%04x ", crc);
 		if (crc == TETRA_CRC_OK) {
-			printf("OK\n");
+			// printf("OK\n");
 			tup->crc_ok = 1;
-			printf("%s %s type1: %s\n", tbp->name, time_str,
-				osmo_ubit_dump(type2, tbp->type1_bits));
-		} else
-			printf("WRONG\n");
+			// printf("%s %s type1: %s\n", tbp->name, time_str,
+				// osmo_ubit_dump(type2, tbp->type1_bits));
+			tms->t_display_st->last_crc_fail = false;
+		} else if(type != TPSAP_T_SCH_F) {
+			// printf("WRONG\n");
+			tms->t_display_st->last_crc_fail = true;
+		}
 	} else if (type == TPSAP_T_BBK) {
 		/* FIXME: RM3014-decode */
 		tup->crc_ok = 1;
+		tms->t_display_st->last_crc_fail = false;
 		memcpy(type2, type4, tbp->type2_bits);
 		DEBUGP("%s %s type1: %s\n", tbp->name, time_str,
 			osmo_ubit_dump(type2, tbp->type1_bits));
@@ -281,12 +244,15 @@ void tp_sap_udata_ind(enum tp_sap_data_type type, int blk_num, const uint8_t *bi
 
 	switch (type) {
 	case TPSAP_T_SB1:
-		printf("TMB-SAP SYNC CC %s(0x%02x) ", osmo_ubit_dump(type2+4, 6), bits_to_uint(type2+4, 6));
-		printf("TN %s(%u) ", osmo_ubit_dump(type2+10, 2), bits_to_uint(type2+10, 2) + 1);
-		printf("FN %s(%2u) ", osmo_ubit_dump(type2+12, 5), bits_to_uint(type2+12, 5));
-		printf("MN %s(%2u) ", osmo_ubit_dump(type2+17, 6), bits_to_uint(type2+17, 6));
-		printf("MCC %s(%u) ", osmo_ubit_dump(type2+31, 10), bits_to_uint(type2+31, 10));
-		printf("MNC %s(%u)\n", osmo_ubit_dump(type2+41, 14), bits_to_uint(type2+41, 14));
+		// printf("TMB-SAP SYNC CC %s(0x%02x) ", osmo_ubit_dump(type2+4, 6), bits_to_uint(type2+4, 6));
+		// printf("TN %s(%u) ", osmo_ubit_dump(type2+10, 2), bits_to_uint(type2+10, 2) + 1);
+		// printf("FN %s(%2u) ", osmo_ubit_dump(type2+12, 5), bits_to_uint(type2+12, 5));
+		// printf("MN %s(%2u) ", osmo_ubit_dump(type2+17, 6), bits_to_uint(type2+17, 6));
+		// printf("MCC %s(%u) ", osmo_ubit_dump(type2+31, 10), bits_to_uint(type2+31, 10));
+		// printf("MNC %s(%u)\n", osmo_ubit_dump(type2+41, 14), bits_to_uint(type2+41, 14));
+		tms->t_display_st->mcc = bits_to_uint(type2+31, 10);
+		tms->t_display_st->mnc = bits_to_uint(type2+41, 14);
+		tms->t_display_st->cc = bits_to_uint(type2+4, 6);
 		/* obtain information from SYNC PDU */
 		if (tup->crc_ok) {
 			tcd->colour_code = bits_to_uint(type2+4, 6);
@@ -317,6 +283,93 @@ void tp_sap_udata_ind(enum tp_sap_data_type type, int blk_num, const uint8_t *bi
 		break;
 	case TPSAP_T_SCH_F:
 		tup->lchan = TETRA_LC_SCH_F;
+		//Process voice frame
+		if (tms->cur_burst.is_traffic) {
+			int16_t block[690];
+			/* Generate a block */
+			memset(block, 0x00, sizeof(int16_t) * 690);
+			for (int i = 0; i < 6; i++)
+				block[115*i] = 0x6b21 + i;
+   
+			for (int i = 0; i < 114; i++)
+				block[1+i] = type4[i] ? -127 : 127;
+   
+			for (int i = 0; i < 114; i++)
+				block[116+i] = type4[114+i] ? -127 : 127;
+   
+			for (int i = 0; i < 114; i++)
+				block[231+i] = type4[228+i] ? -127 : 127;
+   
+			for (int i = 0; i < 90; i++)
+				block[346+i] = type4[342+i] ? -127 : 127;
+			
+			//i'm not sure this is legal, but i don't want to make temp files and execute external programs so
+			
+			//decoding the speech using the etsi codec
+			
+			int16_t interleaved_coded_array[432]; /*time-slot length at 7.2 kb/s*/
+			int16_t  Coded_array[432];
+			int16_t  Reordered_array[286];   /* 2 frames vocoder + 8 + 4 */
+			//block1
+			for(int i = 0; i < 114; i++) {
+				interleaved_coded_array[0+i] = block[1+i];
+			}
+			//block2
+			for(int i = 0; i < 114; i++) {
+				interleaved_coded_array[114+i] = block[(161-45)+i];
+			}
+			//block3
+			for(int i = 0; i < 114; i++) {
+				interleaved_coded_array[(114*2)+i] = block[(321-45-45)+i];
+			}
+			//block4
+			for(int i = 0; i < 90; i++) {
+				interleaved_coded_array[(114*3)+i] = block[(481-45-45-45)+i];
+			}
+			
+			for(int i = 0; i < 432; i++) {
+				if((interleaved_coded_array[i] & 0x0080) == 0x0080) {
+					interleaved_coded_array[i] = interleaved_coded_array[i] | 0xFF00;
+				}
+			}
+			Desinterleaving_Speech(interleaved_coded_array, Coded_array);
+			bool corrupted = Channel_Decoding(tms->codec_first_pass, 0, Coded_array, Reordered_array);
+			tms->codec_first_pass = false;
+			int16_t cdecoder_output[276];
+			cdecoder_output[0] = corrupted;
+			for(int i = 0; i < 137; i++) {
+				cdecoder_output[1+i] = Reordered_array[i];
+			}
+			cdecoder_output[138] = corrupted;
+			for(int i = 0; i < 137; i++) {
+				cdecoder_output[139+i] = Reordered_array[137+i];
+			}
+			
+			int16_t parm[24];
+			int16_t synth[480];
+			int16_t* synth_p2 = &(synth[240]);
+			int16_t serial[138];
+			for(int i = 0; i < 138; i++) {
+				serial[i] = cdecoder_output[i];
+			}
+			Bits2prm_Tetra(serial, parm);	/* serial to parameters */
+			Decod_Tetra(parm, synth);		/* decoder */
+			Post_Process(synth, (int16_t)240);	/* Post processing of synthesis  */
+			for(int i = 0; i < 138; i++) {
+				serial[i] = cdecoder_output[i+138];
+			}
+			Bits2prm_Tetra(serial, parm);	/* serial to parameters */
+			Decod_Tetra(parm, synth_p2);		/* decoder */
+			Post_Process(synth_p2, (int16_t)240);	/* Post processing of synthesis  */
+			//USE SYNTH
+			if(tms->t_display_st->curr_frame != tms->last_frame) {
+				tms->curr_active_timeslot = t_phy_state.time.tn;
+				tms->last_frame = tms->t_display_st->curr_frame;
+			}
+			if(tms->curr_active_timeslot == t_phy_state.time.tn) {
+				tms->put_voice_data(tms->put_voice_data_ctx, 480, synth);
+			}
+		}
 		break;
 	default:
 		/* FIXME: do something */
@@ -327,7 +380,7 @@ void tp_sap_udata_ind(enum tp_sap_data_type type, int blk_num, const uint8_t *bi
 	uint32_t offset = 0;
 	uint8_t *orig_head = msg->head; /* The true start of the timeslot */
 	uint8_t *orig_tail = msg->tail; /* The true end of the timeslot */
-	while (offset < tbp->type1_bits - 16) {
+	while (offset < (uint32_t) (tbp->type1_bits - 16)) {
 		/* send Rx time along with the TMV-UNITDATA.ind primitive */
 		memcpy(&tup->tdma_time, &tcd->time, sizeof(tup->tdma_time));
 
@@ -344,14 +397,16 @@ void tp_sap_udata_ind(enum tp_sap_data_type type, int blk_num, const uint8_t *bi
 		offset += pdu_bits;
 		msg->head = orig_head + offset;		/* New head is old head plus parsed len from prev msg */
 		msg->tail = orig_tail;			/* Restore original tail */
-		msg->len = msg->tail - msg->head;	/* Fixup len */
+		msg->len = (uint16_t)(msg->tail - msg->head);	/* Fixup len */
 		msg->l1h = msg->head;
 		msg->l2h = 0;
 		msg->l3h = 0;
 		msg->l4h = 0;
 	}
 
-out:
-	talloc_free(msg);
-	talloc_free(ttp);
+// out:
+	// talloc_free(msg);
+	free(msg);
+	// talloc_free(ttp);
+	free(ttp);
 }
