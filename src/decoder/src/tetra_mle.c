@@ -466,16 +466,13 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
             unsigned int o = 4;
             for (unsigned int bi = mm_payload_off; bi < len; bi++)
                 mm_bits[o++] = (buf[bi] & 1u);
-#if 0 /* duplicate MM logging path (octets). Disabled to avoid wrong/duplicate pretty logs */
+	            const char *mm_short = tetra_get_mm_pdut_name(pdu_type, 0);
+	            mm_logf_ctx(issi, la, "MM type=0x%X (%s) [bits]",
+	                        (unsigned)pdu_type,
+	                        mm_short ? mm_short : "D-UNKNOWN");
 
-
-            const char *mm_short = tetra_get_mm_pdut_name(pdu_type, 0);
-            mm_logf_ctx(issi, la, "MM type=0x%X (%s) [bits]",
-                        (unsigned)pdu_type,
-                        mm_short ? mm_short : "D-UNKNOWN");
-
-            mm_try_pretty_log(issi, la, mm_bits, mm_len_bits);
-#endif
+	            /* Produce SDR-TETRA-like summary lines (GSSI/CCK/auth result, etc.) when present */
+	            mm_try_pretty_log(issi, la, mm_bits, mm_len_bits);
 
             /* Diagnostics for reserved/unknown types */
             if (!mm_short) {
