@@ -121,11 +121,11 @@ static void mm_try_pretty_log(uint32_t issi, uint32_t la, const uint8_t *mm_bits
 
 	/* Optional fields parsed from Type-3/4 elements (kept local; not all PDUs include them) */
 	uint32_t gssi = 0;
-	uint32_t cck_id = 0;
-	int have_gssi = 0;
-	int have_cck = 0;
-	int auth_ok = 0;
-	int have_auth = 0;
+	uint8_t cck_id = 0;
+	uint8_t have_gssi = 0;
+	uint8_t have_cck = 0;
+	uint8_t auth_ok = 0;
+	uint8_t have_auth = 0;
 
     uint8_t pdu_type = (uint8_t)GET(4);
     ADV(4);
@@ -588,4 +588,3 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
     return (int)len;
 }
 
-#endif
