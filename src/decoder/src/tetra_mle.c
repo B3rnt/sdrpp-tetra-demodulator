@@ -94,10 +94,10 @@ static void mm_scan_type34_elements(uint32_t issi, uint32_t la,
     /* Emit SDR-Tetra-like lines when we have enough info */
     if (out_have_auth && *out_have_auth) {
         if (*out_auth_ok) {
-            mm_logf_ctx(issi, la, "BS result to MS authentication: Authentication successful or no authentication currently in progress SSI: %u - Authentication successful or no authentication currently in progress", issi);
-        } else {
-            mm_logf_ctx(issi, la, "BS result to MS authentication: Authentication failed or rejected SSI: %u", issi);
-        }
+            /* do not log here; caller decides when to emit */
+} else {
+            /* do not log here; caller decides when to emit */
+}
     }
 
     if (out_have_gssi && *out_have_gssi) {
@@ -122,7 +122,59 @@ static void mm_try_pretty_log(uint32_t issi, uint32_t la, const uint8_t *mm_bits
     uint8_t pdu_type = (uint8_t)GET(4);
     ADV(4);
 
-    /* Try to extract common Type-34 elements from *any* MM PDU. This is what
+    
+    /* Location updating / registration accept: use Type-3/4 elements to extract GSSI/CCK/auth result */
+    if (pdu_type == 0x5 /* D-LOC-UPD-ACC */) {
+        /* Extract Type-3/4 elements from this PDU */
+        mm_scan_type34_elements(issi, la, mm_bits, mm_len_bits,
+                                &gssi, &have_gssi,
+                                &cck_id, &have_cck,
+                                &auth_ok, &have_auth);
+
+        if (have_auth) {
+            mm_logf_ctx(issi, la,
+                "BS result to MS authentication: %s SSI: %u - %s",
+                auth_ok ? "Authentication successful or no authentication currently in progress"
+                        : "Authentication failed or rejected",
+                issi,
+                auth_ok ? "Authentication successful or no authentication currently in progress"
+                        : "Authentication failed or rejected");
+        }
+
+        if (have_gssi) {
+            char extra[192];
+            extra[0] = 0;
+
+            /* Mirror SDR-Tetra's wording for the common case */
+            if (have_auth) {
+                strncat(extra, auth_ok
+                    ? " - Authentication successful or no authentication currently in progress"
+                    : " - Authentication failed or rejected",
+                    sizeof(extra) - strlen(extra) - 1);
+            }
+            if (have_cck) {
+                char tmp[64];
+                snprintf(tmp, sizeof(tmp), " - CCK_identifier: %u", (unsigned)cck_id);
+                strncat(extra, tmp, sizeof(extra) - strlen(extra) - 1);
+            }
+
+            /* In these logs this typically indicates roaming location updating */
+            strncat(extra, " - Roaming location updating", sizeof(extra) - strlen(extra) - 1);
+
+            mm_logf_ctx(issi, la,
+                "MS request for registration/authentication ACCEPTED for SSI: %u GSSI: %u%s",
+                issi, gssi, extra);
+        }
+
+        return;
+    }
+
+    /* Location updating processing is noisy and usually not shown in SDR-Tetra logs */
+    if (pdu_type == 0x9 /* D-LOC-UPD-PROC */) {
+        return;
+    }
+
+/* Try to extract common Type-34 elements from *any* MM PDU. This is what
      * makes us match SDR-Tetra better on networks that carry auth-result / GSSI
      * in D-LOC-UPD-PROC (0x9) rather than only D-LOC-UPD-ACC (0x5).
      */
@@ -342,6 +394,7 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
                 snprintf(tmp, sizeof(tmp), "%u", (unsigned)(buf[i] & 1u));
                 strncat(dump, tmp, sizeof(dump) - strlen(dump) - 1);
             }
+#ifdef TETRA_VERBOSE_MLE
             mm_logf_ctx(issi, la, "MLE PDISC=0 reserved/unknown, bits[0..%u]=%s",
                         n ? (n - 1) : 0, dump);
             return (int)len;
@@ -363,6 +416,7 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
                 snprintf(tmp, sizeof(tmp), "%u", (unsigned)(buf[i] & 1u));
                 strncat(dump, tmp, sizeof(dump) - strlen(dump) - 1);
             }
+#ifdef TETRA_VERBOSE_MLE
             mm_logf_ctx(issi, la, "MLE PDISC=%u reserved/unknown, bits[0..%u]=%s",
                         (unsigned)mle_pdisc, n ? (n - 1) : 0, dump);
             return (int)len;
@@ -524,3 +578,4 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
     return (int)len;
 }
 
+#endif
