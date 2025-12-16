@@ -196,7 +196,7 @@ static int mm_find_and_log_loc_upd_acc(uint32_t issi, uint16_t la,
     if (pdu_type != 0x5) return 0; // Niet D-LOC-UPD-ACC
 
     // Debug raw data om te zien wat er mis gaat
-    // log_debug_bits(issi, mm_bits, mm_len_bits, "D-LOC-UPD-ACC Raw");
+    log_debug_bits(issi, mm_bits, mm_len_bits, "D-LOC-UPD-ACC Raw");
 
     /* Standaard Header Parsing */
     pos += 3; // LocUpdType
