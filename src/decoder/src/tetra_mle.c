@@ -18,7 +18,7 @@
  *  - Group identity location accept (tid 0x5) can contain nested type3/4 elements such as Group identity downlink (tid 0x7):
  *    -> recurse into payload of 0x5, scan for 0x7 inside.
  *  - Authentication result should be decoded from D-AUTH (MM pdu_type 0x1) sub-type + R1 bit,
- *    NOT from a made-up Type-3 element (removes tid==0xA auth heuristic).
+ *    NOT from a Type-3 element.
  */
 
 static const char *mm_auth_subtype_str(uint8_t st) {
@@ -31,21 +31,6 @@ static const char *mm_auth_subtype_str(uint8_t st) {
     }
 }
 
-/* Forward */
-static void mm_try_pretty_log(uint32_t issi, uint16_t la,
-                              const uint8_t *mm_bits, unsigned int mm_len_bits);
-
-/*
- * Decode Type-3/4 MM elements using ETSI descriptor:
- *   M-bit (1) + Type-3/4 element identifier (4) + LI (11) => 16 bits total
- *   followed by LI bits of user data, right-aligned to whole octets.
- *
- * Robust scan: sliding window on bit offsets, accept only plausible descriptors (M=1, 0<LI<=2047),
- * then jump over element.
- *
- * Important: tid==0x5 (Group identity location accept) can CONTAIN nested type3/4 elements like tid==0x7,
- * so we recurse into its payload to find 0x7 and extract GSSI(s).
- */
 static void mm_scan_type34_elements(const uint8_t *bits, unsigned int bitlen,
                                    unsigned int start_bit,
                                    uint32_t *out_gssi, uint8_t *out_have_gssi,
@@ -63,7 +48,7 @@ static void mm_scan_type34_elements(const uint8_t *bits, unsigned int bitlen,
     if (!bits || bitlen <= start_bit) return;
 
     /* helper: add unique GSSI into caller list */
-    #define ADD_GSSI(_g) do { \
+#define ADD_GSSI(_g) do { \
         uint32_t __g = (_g) & 0x00FFFFFFu; \
         if (__g != 0u && __g != 0x00FFFFFFu && out_gssi_list && out_gssi_count && out_gssi_max) { \
             uint8_t __n = *out_gssi_count; \
@@ -93,8 +78,7 @@ static void mm_scan_type34_elements(const uint8_t *bits, unsigned int bitlen,
 
         /*
          * tid 0x5: Group identity location accept
-         * Often contains nested type3/4 descriptors (e.g. tid 0x7) inside its payload.
-         * Recurse into its LI-bit payload (edata points to start of LI bits).
+         * Can contain nested type3/4 descriptors (e.g. tid 0x7) inside its payload.
          */
         if (tid == 0x5 && li >= 16u) {
             mm_scan_type34_elements(edata, li, 0,
@@ -107,20 +91,16 @@ static void mm_scan_type34_elements(const uint8_t *bits, unsigned int bitlen,
 
         /*
          * tid 0x7: Group identity downlink
-         * GSSI is 24 bits inside the group identity structure; many implementations carry
-         * the group identity in 32 bits with upper bits being type/flags.
-         *
-         * Because user data is right-aligned to octets, prefer 32-bit windows that end on octet boundaries.
+         * Extract GSSI best-effort:
+         * - Try 32-bit windows on octet boundaries; keep last 24 bits and also a 24-bit window variant.
          */
         if (tid == 0x7 && li >= 24u) {
-            /* We search inside LI bits on octet boundaries */
             unsigned int scan_start = 0;
             while (scan_start + 32u <= li) {
                 if ((scan_start % 8u) == 0u) {
                     uint32_t v32 = bits_to_uint(edata + scan_start, 32);
                     ADD_GSSI(v32);
 
-                    /* also try exact 24-bit window at end of that dword */
                     uint32_t v24 = bits_to_uint(edata + scan_start + 8u, 24);
                     ADD_GSSI(v24);
                 }
@@ -133,19 +113,14 @@ static void mm_scan_type34_elements(const uint8_t *bits, unsigned int bitlen,
             }
         }
 
-        /*
-         * tid 0x6: CCK information (best-effort; take last octet)
-         */
+        /* tid 0x6: CCK information (best-effort; take last octet) */
         if (tid == 0x6 && li >= 8u && out_cck_id && out_have_cck) {
             uint32_t v = bits_to_uint(edata + (li - 8u), 8);
             *out_cck_id = (uint8_t)v;
             *out_have_cck = 1;
         }
 
-        /*
-         * Roaming / ITSI attach flags:
-         * Keep best-effort heuristics. (Networks vary; without a bitdump we cannot be fully normative here.)
-         */
+        /* Best-effort roaming / ITSI attach flags */
         if (tid == 0x2 && li >= 1u && out_roam_lu && out_have_roam_lu) {
             uint32_t v = bits_to_uint(edata + (li - 1u), 1);
             *out_roam_lu = (uint8_t)(v & 1u);
@@ -160,41 +135,41 @@ static void mm_scan_type34_elements(const uint8_t *bits, unsigned int bitlen,
         pos += elem_bits_total;
     }
 
-    #undef ADD_GSSI
+#undef ADD_GSSI
 }
 
-/*
- * Pretty logging aligned with what SDR-TETRA shows:
- *  - D-AUTH (0x1): log DEMAND and RESULT using Authentication sub-type + 1-bit result
- *  - D-LOC-UPD-ACC (0x5): scan type3/4 elements, including nested 0x5->0x7, to extract GSSI and CCK/flags
- */
 static void mm_try_pretty_log(uint32_t issi, uint16_t la,
                               const uint8_t *mm_bits, unsigned int mm_len_bits)
 {
     if (!mm_bits || mm_len_bits < 4) return;
 
     unsigned int pos = 0;
-    #define HAVE(N) (pos + (N) <= mm_len_bits)
-    #define GET(N)  (HAVE(N) ? bits_to_uint(mm_bits + pos, (N)) : 0)
-    #define ADV(N)  do { pos += (N); } while (0)
+
+#define HAVE(N) (pos + (N) <= mm_len_bits)
+#define GET(N)  (HAVE(N) ? bits_to_uint(mm_bits + pos, (N)) : 0)
+#define ADV(N)  do { pos += (N); } while (0)
 
     uint8_t pdu_type = (uint8_t)GET(4);
     ADV(4);
 
     /* --- ETSI: D-AUTHENTICATION (0x1) --- */
     if (pdu_type == 0x1) {
-        if (!HAVE(2)) { #undef HAVE #undef GET #undef ADV return; }
+        if (!HAVE(2)) {
+            goto out;
+        }
         uint8_t st = (uint8_t)GET(2);
         ADV(2);
 
         if (st == 0) {
             mm_logf_ctx(issi, la, "BS demands authentication: SSI: %u", (unsigned)issi);
-            #undef HAVE #undef GET #undef ADV
-            return;
+            goto out;
         }
 
-        if (st == 2 /* RESULT */ && HAVE(1)) {
-            uint8_t r1 = (uint8_t)GET(1); /* Authentication result flag */
+        if (st == 2 /* RESULT */) {
+            if (!HAVE(1)) {
+                goto out;
+            }
+            uint8_t r1 = (uint8_t)GET(1);
             mm_logf_ctx(issi, la,
                         "BS result to MS authentication: %s SSI: %u - %s",
                         r1 ? "Authentication successful or no authentication currently in progress"
@@ -202,18 +177,13 @@ static void mm_try_pretty_log(uint32_t issi, uint16_t la,
                         (unsigned)issi,
                         r1 ? "Authentication successful or no authentication currently in progress"
                            : "Authentication failed or rejected");
-            #undef HAVE #undef GET #undef ADV
-            return;
+            goto out;
         }
 
-        /* optional: trace other subtypes very lightly */
+        /* Optional trace for other subtypes */
         mm_logf_ctx(issi, la, "D-AUTH sub-type=%s SSI=%u",
                     mm_auth_subtype_str(st), (unsigned)issi);
-
-        #undef HAVE
-        #undef GET
-        #undef ADV
-        return;
+        goto out;
     }
 
     /* --- D-LOC-UPD-ACC (0x5) --- */
@@ -231,12 +201,11 @@ static void mm_try_pretty_log(uint32_t issi, uint16_t la,
 
         mm_scan_type34_elements(mm_bits, mm_len_bits, 4,
                                 &gssi, &have_gssi,
-                                gssi_list, &gssi_count, (uint8_t)(sizeof(gssi_list)/sizeof(gssi_list[0])),
+                                gssi_list, &gssi_count, (uint8_t)(sizeof(gssi_list) / sizeof(gssi_list[0])),
                                 &cck_id, &have_cck,
                                 &roam_lu, &have_roam_lu,
                                 &itsi_attach, &have_itsi_attach);
 
-        /* Build tail similar to SDR-TETRA */
         char tail[192];
         tail[0] = 0;
 
@@ -254,7 +223,8 @@ static void mm_try_pretty_log(uint32_t issi, uint16_t la,
 
         if (have_gssi) {
             if (gssi_count > 1) {
-                char gbuf[128]; gbuf[0] = 0;
+                char gbuf[128];
+                gbuf[0] = 0;
                 size_t o2 = 0;
                 for (uint8_t i = 0; i < gssi_count; i++) {
                     char tmp[24];
@@ -262,7 +232,8 @@ static void mm_try_pretty_log(uint32_t issi, uint16_t la,
                     size_t tl = strlen(tmp);
                     if (o2 + tl + 1 >= sizeof(gbuf)) break;
                     memcpy(gbuf + o2, tmp, tl);
-                    o2 += tl; gbuf[o2] = 0;
+                    o2 += tl;
+                    gbuf[o2] = 0;
                 }
                 mm_logf_ctx(issi, la,
                             "MS request for registration/authentication ACCEPTED for SSI: %u GSSI(s): %s%s",
@@ -273,21 +244,18 @@ static void mm_try_pretty_log(uint32_t issi, uint16_t la,
                             (unsigned)issi, (unsigned)gssi, tail);
             }
         } else {
-            /* still useful to show this line; tells you you *did* catch 0x5 but no GSSI parsed */
             mm_logf_ctx(issi, la,
                         "MS request for registration/authentication ACCEPTED for SSI: %u (no GSSI decoded)%s",
                         (unsigned)issi, tail);
         }
-
-        #undef HAVE
-        #undef GET
-        #undef ADV
-        return;
+        goto out;
     }
 
-    #undef HAVE
-    #undef GET
-    #undef ADV
+out:
+#undef HAVE
+#undef GET
+#undef ADV
+    return;
 }
 
 /* Receive TL-SDU (LLC SDU == MLE PDU) */
@@ -369,7 +337,6 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
             }
             if (!pdisc_ok) continue;
 
-            /* If MM, ensure we can read 4 bits for type (keep permissive) */
             if (pdisc == TMLE_PDISC_MM) {
                 if (len < off + 3 + 4) continue;
                 uint8_t mt = (uint8_t)(((buf[off+3] & 1u) << 3) | ((buf[off+4] & 1u) << 2) |
@@ -407,21 +374,9 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
                     tetra_get_mle_pdisc_name(mle_pdisc));
 
         if (mle_pdisc == 0 || tetra_get_mle_pdisc_name(mle_pdisc) == NULL) {
-            char dump[256]; dump[0] = '\0';
-            unsigned int n = (len > 32) ? 32 : len;
-            for (unsigned int i = 0; i < n; i++) {
-                char tmp[4];
-                snprintf(tmp, sizeof(tmp), "%u", (unsigned)(buf[i] & 1u));
-                strncat(dump, tmp, sizeof(dump) - strlen(dump) - 1);
-            }
-#ifdef TETRA_VERBOSE_MLE
-            mm_logf_ctx(issi, la, "MLE PDISC=%u reserved/unknown, bits[0..%u]=%s",
-                        (unsigned)mle_pdisc, n ? (n - 1) : 0, dump);
-#endif
             return (int)len;
         }
 
-        /* MM: next 4 bits are the MM PDU type */
         if (mle_pdisc == TMLE_PDISC_MM) {
             unsigned int mm_type_off = pdisc_off + 3;
             unsigned int mm_payload_off = pdisc_off + 7;
@@ -457,34 +412,19 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
                         (unsigned)pdu_type,
                         mm_short ? mm_short : "D-UNKNOWN");
 
-            /* ETSI-aligned pretty logging for D-AUTH (0x1) and D-LOC-UPD-ACC (0x5) */
             mm_try_pretty_log(issi, la, mm_bits, mm_len_bits);
-
-            if (!mm_short) {
-                char dump[256]; dump[0] = '\0';
-                unsigned int n = (len > 32) ? 32 : len;
-                for (unsigned int i = 0; i < n; i++) {
-                    char tmp[4];
-                    snprintf(tmp, sizeof(tmp), "%u", (unsigned)(buf[i] & 1u));
-                    strncat(dump, tmp, sizeof(dump) - strlen(dump) - 1);
-                }
-                mm_logf_ctx(issi, la, "MM unknown, bits[0..%u]=%s", n ? (n - 1) : 0, dump);
-            }
             return (int)len;
         }
 
-        /* Non-MM PDISC (CMCE/SNDCP/etc.) not decoded in this fork */
         return (int)len;
     }
 
-    /* ----- Packed octets path ----- */
+    /* Packed octets path (unchanged logic, but benefits from new mm_try_pretty_log) */
     const uint8_t *oct = buf;
 
-    /* Primary interpretation: low nibble is PDISC, high nibble is PDU type */
     uint8_t mle_pdisc = (uint8_t)(oct[0] & 0x0F);
     uint8_t pdu_type  = (uint8_t)((oct[0] >> 4) & 0x0F);
 
-    /* Sanity fallback: some stacks swap nibbles */
     uint8_t mle_pdisc_alt = (uint8_t)((oct[0] >> 4) & 0x0F);
     uint8_t pdu_type_alt  = (uint8_t)(oct[0] & 0x0F);
 
@@ -502,16 +442,6 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
                 used_alt ? " [nibble-swap]" : "");
 
     if (mle_pdisc == 0 || tetra_get_mle_pdisc_name(mle_pdisc) == NULL) {
-        char dump[256]; dump[0] = '\0';
-        unsigned int n = (len > 16) ? 16 : len;
-        for (unsigned int i = 0; i < n; i++) {
-            char tmp[8];
-            snprintf(tmp, sizeof(tmp), "%02X", oct[i]);
-            strncat(dump, tmp, sizeof(dump) - strlen(dump) - 1);
-            if (i + 1 < n) strncat(dump, " ", sizeof(dump) - strlen(dump) - 1);
-        }
-        mm_logf_ctx(issi, la, "MLE PDISC=%u reserved/unknown, octets[0..%u]=%s",
-                    (unsigned)mle_pdisc, n ? (n - 1) : 0, dump);
         return (int)len;
     }
 
@@ -547,19 +477,6 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
                     mm_short ? mm_short : "D-UNKNOWN");
 
         mm_try_pretty_log(issi, la, mm_bits, mm_len_bits);
-
-        if (!mm_short) {
-            char dump[256]; dump[0] = '\0';
-            unsigned int n = (len > 16) ? 16 : len;
-            for (unsigned int i = 0; i < n; i++) {
-                char tmp[8];
-                snprintf(tmp, sizeof(tmp), "%02X", oct[i]);
-                strncat(dump, tmp, sizeof(dump) - strlen(dump) - 1);
-                if (i + 1 < n) strncat(dump, " ", sizeof(dump) - strlen(dump) - 1);
-            }
-            mm_logf_ctx(issi, la, "MM unknown, octets[0..%u]=%s", n ? (n - 1) : 0, dump);
-        }
-
         return (int)len;
     }
     default:
