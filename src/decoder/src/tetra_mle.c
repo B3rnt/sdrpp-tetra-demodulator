@@ -149,7 +149,7 @@ static void mm_debug_dump_mm_ctx(uint32_t issi, uint16_t la,
 
     uint8_t pdisc = (uint8_t)get_bits(bits, nbits, pdisc_off, 3);
     /* try multiple type offsets like the decoder */
-    unsigned int type_offsets[4] = { pdisc_off + 3, pdisc_off + 4, pdisc_off + 5, pdisc_off + 6 };
+    unsigned int type_offsets[4] = { pdisc_off + 4, pdisc_off + 3, pdisc_off + 5, pdisc_off + 6 };
 
     mm_logf_ctx(issi, la, "MM DEBUG: pdisc_off=%u PDISC=%u", pdisc_off, (unsigned)pdisc);
 
@@ -469,7 +469,7 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
 #endif
 
         /* Probeer beide layouts */
-        unsigned int type_offsets[4] = { off + 3, off + 4, off + 5, off + 6 };
+        unsigned int type_offsets[4] = { off + 4, off + 3, off + 5, off + 6 };
 
         for (unsigned int vi = 0; vi < 4; vi++) {
             unsigned int toff = type_offsets[vi];
@@ -531,8 +531,22 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
                                                         mm_rules_loc_upd_accept, mm_rules_loc_upd_accept_count,
                                                         &fs);
 
-                /* Now Type-3/4 elements start AFTER the header (this was the big difference vs. heuristic scanning) */
-                int t34 = find_first_type34(bits, nbits, after_hdr);
+                /* SDR#-like: Type-3/4 elements start EXACTLY after rules_0 header.
+                   If it doesn't look like a valid Type-3/4 header, fall back to scanning forward. */
+                int t34 = -1;
+                if (after_hdr + 16u <= nbits) {
+                    uint32_t mbit = get_bits(bits, nbits, after_hdr, 1);
+                    uint32_t tid  = get_bits(bits, nbits, after_hdr + 1, 4);
+                    uint32_t li   = get_bits(bits, nbits, after_hdr + 5, 11);
+                    if (mbit == 1 && li > 0 && li <= 512 &&
+                        (tid == 0x5 || tid == 0x6 || tid == 0x2 || tid == 0x7) &&
+                        after_hdr + 16u + (unsigned int)li <= nbits) {
+                        t34 = (int)after_hdr;
+                    }
+                }
+                if (t34 < 0) {
+                    t34 = find_first_type34(bits, nbits, after_hdr);
+                }
 
                 uint32_t gssi_list[8];
                 uint8_t gssi_count = 0;
