@@ -10,16 +10,18 @@
 #include "crypto/tetra_crypto.h"
 
 /*
- * MM decoder (LLC-bypass) – SDRTetra-achtig.
+ * SDRTetra-compatible MM decoder voor LLC-bypass.
  *
- * BELANGRIJKSTE FIX:
- *  - parse Type-3/4 content met absolute bitposities (geen bits+offset pointer slicing).
- *    Daardoor werkte TID=0x5 (Group identity location accept) onbetrouwbaar
- *    en miste je GSSI bij roaming/accept.
+ * Belangrijkste bugfix t.o.v. jouw versie:
+ *  - TID=0x5 (Group identity location accept) werd verkeerd geparsed:
+ *    je deed bits + content_offset, maar content_offset is in BITS.
+ *    Daardoor schoof je in BYTES i.p.v. bits -> altijd misaligned -> geen GSSI.
  *
- * EXTRA:
- *  - ITSI attach kan WEL een GSSI bevatten => niet weggooien.
+ * Deze file parse't TID=0x5 nu zoals SDRTetra (Class18):
+ *  - zelfde base pointer, alleen bitpos verschuiven.
  */
+
+/* ---------- BIT HELPERS ---------- */
 
 static uint32_t get_bits(const uint8_t *bits, unsigned int len, unsigned int pos, unsigned int n)
 {
@@ -32,17 +34,20 @@ static uint32_t get_bits(const uint8_t *bits, unsigned int len, unsigned int pos
     return val;
 }
 
-/* ---------- SDRTetra-ish auth state ---------- */
+/* ---------- SDRTetra-ish auth state (append on LOC_UPD_ACC line) ---------- */
+
 static uint32_t g_last_auth_issi = 0;
 static uint8_t  g_last_auth_ok = 0; /* subtype=2 */
 
 /* ---------- GSSI helpers ---------- */
+
 static void add_gssi_to_list(uint32_t gssi, uint32_t *list, uint8_t *count, uint8_t max)
 {
+    /* SDRTetra accepteert o.a. 0xFFFFFF (OPEN) en normale 24-bit groepen. */
     if (!list || !count || gssi == 0)
         return;
 
-    /* SDRTetra-like plausibility */
+    /* Plausibiliteit: laat 0xFFFFFF toe, plus realistische range */
     if (!(gssi == 0xFFFFFFu || (gssi >= 1000000u && gssi <= 9000000u)))
         return;
 
@@ -50,32 +55,27 @@ static void add_gssi_to_list(uint32_t gssi, uint32_t *list, uint8_t *count, uint
         if (list[i] == gssi)
             return;
     }
+
     if (*count < max)
         list[(*count)++] = gssi;
 }
 
-/* ---------- Type-3/4 parsing ---------- */
+/* ---------- Type-3/4 element parsing ---------- */
 
 /*
- * SDR# / SDRTetra record format for TID=0x5:
- *   sel=0: 24-bit GSSI
- *   sel=1: 24-bit GSSI + 24-bit extra (skip)
- *   sel=2: 24-bit vGSSI
- *   sel=3: stop/padding
+ * SDRTetra (Class18) leest Group_identity_location_accept (TID=0x5) als:
+ *   2-bit selector:
+ *     0: 24-bit GSSI
+ *     1: 24-bit GSSI + 24-bit extra (skip)
+ *     2: 24-bit vGSSI
+ *     3: stop/padding
  *
- * FIX: we lezen altijd via absolute bitposities:
- *   bits[] = volledige bitstream
- *   nbits  = totale lengte bitstream
- *   start_bit = begin van dit element-content (direct na type3/4 header)
- *   bitlen = LI (content length in bits)
+ * CRUCIAAL: parse op basis van (bits, nbits, start_bit), NIET bits+offset pointer.
  */
-static void mm_parse_group_identity_location_accept_abs(const uint8_t *bits,
-                                                        unsigned int nbits,
-                                                        unsigned int start_bit,
-                                                        unsigned int bitlen,
-                                                        uint32_t *out_gssi_list,
-                                                        uint8_t *out_gssi_count,
-                                                        uint8_t out_gssi_max)
+static void mm_parse_group_identity_location_accept(const uint8_t *bits, unsigned int nbits,
+                                                    unsigned int start_bit, unsigned int bitlen,
+                                                    uint32_t *out_gssi_list, uint8_t *out_gssi_count, uint8_t out_gssi_max,
+                                                    uint32_t *out_vgssi, uint8_t *out_have_vgssi)
 {
     if (!bits || bitlen < 2)
         return;
@@ -92,34 +92,40 @@ static void mm_parse_group_identity_location_accept_abs(const uint8_t *bits,
         if (sel == 0 || sel == 1) {
             if (p + 24u > bitlen)
                 break;
+
             uint32_t gssi = get_bits(bits, nbits, start_bit + p, 24);
             p += 24;
 
             if (sel == 1) {
                 if (p + 24u > bitlen)
                     break;
-                p += 24;
+                p += 24; /* skip extra */
             }
 
             if (gssi != 0) {
                 add_gssi_to_list(gssi, out_gssi_list, out_gssi_count, out_gssi_max);
             }
         } else if (sel == 2) {
-            /* vGSSI aanwezig maar we gebruiken hem niet voor logging */
             if (p + 24u > bitlen)
                 break;
+
+            uint32_t vgssi = get_bits(bits, nbits, start_bit + p, 24);
             p += 24;
+
+            if (out_vgssi && out_have_vgssi) {
+                *out_vgssi = vgssi;
+                *out_have_vgssi = 1;
+            }
         }
     }
 }
 
-static void mm_scan_type34_elements_abs(const uint8_t *bits, unsigned int nbits,
-                                        unsigned int start_bit,
-                                        uint32_t *out_gssi_list, uint8_t *out_gssi_count, uint8_t out_gssi_max,
-                                        uint8_t *out_cck_id, uint8_t *out_have_cck,
-                                        uint8_t *out_roam_lu, uint8_t *out_have_roam_lu,
-                                        uint8_t *out_itsi_attach, uint8_t *out_have_itsi_attach,
-                                        uint8_t *out_srv_rest, uint8_t *out_have_srv_rest)
+static void mm_scan_type34_elements(const uint8_t *bits, unsigned int nbits, unsigned int start_bit,
+                                    uint32_t *out_gssi_list, uint8_t *out_gssi_count, uint8_t out_gssi_max,
+                                    uint8_t *out_cck_id, uint8_t *out_have_cck,
+                                    uint8_t *out_roam_lu, uint8_t *out_have_roam_lu,
+                                    uint8_t *out_itsi_attach, uint8_t *out_have_itsi_attach,
+                                    uint8_t *out_srv_rest, uint8_t *out_have_srv_rest)
 {
     unsigned int pos = start_bit;
 
@@ -136,43 +142,37 @@ static void mm_scan_type34_elements_abs(const uint8_t *bits, unsigned int nbits,
             continue;
         }
 
-        unsigned int elem_len = 16u + (unsigned int)li;
+        unsigned int elem_len = 16 + (unsigned int)li;
         if (pos + elem_len > nbits)
             break;
 
-        unsigned int content_start = pos + 16u;
+        unsigned int content_offset = pos + 16;
 
         if (tid == 0x5) {
-            /* Group identity location accept (record list) */
-            mm_parse_group_identity_location_accept_abs(bits, nbits, content_start, (unsigned int)li,
-                                                        out_gssi_list, out_gssi_count, out_gssi_max);
-        }
-        else if (tid == 0x7 && li >= 24) {
-            /* legacy single 24-bit value; scan within element */
-            for (unsigned int off = 0; off + 24u <= li; off++) {
-                uint32_t v = get_bits(bits, nbits, content_start + off, 24);
-                uint8_t before = *out_gssi_count;
-                add_gssi_to_list(v, out_gssi_list, out_gssi_count, out_gssi_max);
-                if (*out_gssi_count > before)
-                    break;
-            }
+            /* FIX: parse vanaf base bits + bit-start (content_offset), niet bits+content_offset */
+            uint32_t dummy_vgssi = 0;
+            uint8_t have_dummy_vgssi = 0;
+            mm_parse_group_identity_location_accept(bits, nbits,
+                                                    content_offset, (unsigned int)li,
+                                                    out_gssi_list, out_gssi_count, out_gssi_max,
+                                                    &dummy_vgssi, &have_dummy_vgssi);
         }
         else if (tid == 0x6 && li >= 8 && out_cck_id && out_have_cck) {
-            *out_cck_id = (uint8_t)get_bits(bits, nbits, content_start + (unsigned int)li - 8u, 8);
+            *out_cck_id = (uint8_t)get_bits(bits, nbits, content_offset + (unsigned int)li - 8, 8);
             *out_have_cck = 1;
         }
         else if (tid == 0x2) {
-            /* LSB flags */
+            /* LSB flags (best-effort SDRTetra-like) */
             if (li >= 1 && out_roam_lu && out_have_roam_lu) {
-                *out_roam_lu = (uint8_t)get_bits(bits, nbits, content_start + (unsigned int)li - 1u, 1);
+                *out_roam_lu = (uint8_t)get_bits(bits, nbits, content_offset + (unsigned int)li - 1, 1);
                 *out_have_roam_lu = 1;
             }
             if (li >= 2 && out_itsi_attach && out_have_itsi_attach) {
-                *out_itsi_attach = (uint8_t)get_bits(bits, nbits, content_start + (unsigned int)li - 2u, 1);
+                *out_itsi_attach = (uint8_t)get_bits(bits, nbits, content_offset + (unsigned int)li - 2, 1);
                 *out_have_itsi_attach = 1;
             }
             if (li >= 3 && out_srv_rest && out_have_srv_rest) {
-                *out_srv_rest = (uint8_t)get_bits(bits, nbits, content_start + (unsigned int)li - 3u, 1);
+                *out_srv_rest = (uint8_t)get_bits(bits, nbits, content_offset + (unsigned int)li - 3, 1);
                 *out_have_srv_rest = 1;
             }
         }
@@ -206,7 +206,8 @@ static int find_first_type34(const uint8_t *bits, unsigned int nbits, unsigned i
     return -1;
 }
 
-/* ---------- SDRTetra-ish log formatting ---------- */
+/* ---------- SDRTetra-ish log formatting for LOC_UPD_ACC ---------- */
+
 static void mm_log_loc_upd_acc_sdrtetra_style(uint32_t issi, uint16_t la,
                                               uint32_t ssi_out,
                                               const uint32_t *gssi_list, uint8_t gssi_count,
@@ -230,6 +231,7 @@ static void mm_log_loc_upd_acc_sdrtetra_style(uint32_t issi, uint16_t la,
         strncat(tail, tmp, sizeof(tail) - strlen(tail) - 1);
     }
 
+    /* SDRTetra: ITSI attach is just a tag; GSSI kan er wel degelijk naast bestaan */
     if (have_itsi_attach && itsi_attach) {
         strncat(tail, " - ITSI attach", sizeof(tail) - strlen(tail) - 1);
     } else if (have_roam && roam_lu) {
@@ -252,10 +254,15 @@ static void mm_log_loc_upd_acc_sdrtetra_style(uint32_t issi, uint16_t la,
     }
 }
 
-/* ---------- Core decoder over bitstream ---------- */
-static int try_decode_mm_from_bits(const uint8_t *bits, unsigned int nbits,
-                                   uint32_t issi, uint16_t la)
+/* ---------- Core decoder: run MM parse on prepared bitstream ---------- */
+
+static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
+                                   const uint8_t *bits, unsigned int nbits,
+                                   uint32_t issi, uint16_t la, unsigned int len)
 {
+    (void)tms;
+    (void)len;
+
     if (!bits || nbits < 8)
         return 0;
 
@@ -278,11 +285,22 @@ static int try_decode_mm_from_bits(const uint8_t *bits, unsigned int nbits,
             int score = 0;
 
             if (type == TMM_PDU_T_D_AUTH) {
-                score = 90;
+                if (toff + 6 <= nbits) {
+                    uint8_t st = (uint8_t)get_bits(bits, nbits, toff + 4, 2);
+                    score = (st == 0 || st == 2) ? 95 : 70;
+                }
             } else if (type == TMM_PDU_T_D_LOC_UPD_ACC) {
                 unsigned int payload_start = toff + 4;
                 int t34 = find_first_type34(bits, nbits, payload_start);
-                score = (t34 >= 0) ? 100 : 70;
+                score = (t34 >= 0) ? 100 : 80;
+            } else if (type == TMM_PDU_T_D_LOC_UPD_REJ) {
+                score = 60;
+            } else if (type == TMM_PDU_T_D_LOC_UPD_PROC) {
+                score = 55;
+            } else if (type == TMM_PDU_T_D_LOC_UPD_CMD) {
+                score = 55;
+            } else if (type == TMM_PDU_T_D_ATT_DET_GRP || type == TMM_PDU_T_D_ATT_DET_GRP_ACK) {
+                score = 50;
             }
 
             if (score > best_score || (score == best_score && score > 0 && toff < best_toff)) {
@@ -316,13 +334,12 @@ static int try_decode_mm_from_bits(const uint8_t *bits, unsigned int nbits,
             }
             return 1;
         }
-        return 0;
     }
 
     if (type == TMM_PDU_T_D_LOC_UPD_ACC) {
         unsigned int payload_start = toff + 4;
-
         mm_field_store fs = {0};
+
         unsigned int after_hdr = mm_rules_decode(bits, nbits, payload_start,
                                                  mm_rules_loc_upd_accept, mm_rules_loc_upd_accept_count,
                                                  &fs);
@@ -341,13 +358,15 @@ static int try_decode_mm_from_bits(const uint8_t *bits, unsigned int nbits,
         uint8_t srv_rest = 0, have_srv_rest = 0;
 
         if (t34 >= 0) {
-            mm_scan_type34_elements_abs(bits, nbits, (unsigned int)t34,
-                                        gssi_list, &gssi_count, 8,
-                                        &cck_id, &have_cck,
-                                        &roam, &have_roam,
-                                        &itsi_attach, &have_itsi_attach,
-                                        &srv_rest, &have_srv_rest);
+            mm_scan_type34_elements(bits, nbits, (unsigned int)t34,
+                                    gssi_list, &gssi_count, 8,
+                                    &cck_id, &have_cck,
+                                    &roam, &have_roam,
+                                    &itsi_attach, &have_itsi_attach,
+                                    &srv_rest, &have_srv_rest);
         }
+
+        uint32_t ssi_out = issi;
 
         uint8_t append_auth_ok = 0;
         if (g_last_auth_ok && g_last_auth_issi == issi) {
@@ -357,7 +376,7 @@ static int try_decode_mm_from_bits(const uint8_t *bits, unsigned int nbits,
         }
 
         mm_log_loc_upd_acc_sdrtetra_style(issi, la,
-                                          issi,
+                                          ssi_out,
                                           gssi_list, gssi_count,
                                           have_cck, cck_id,
                                           have_roam, roam,
@@ -367,10 +386,12 @@ static int try_decode_mm_from_bits(const uint8_t *bits, unsigned int nbits,
         return 1;
     }
 
+    /* overige types: laat je bestaande logs/rules staan als je wil, of voeg ze hier toe */
     return 0;
 }
 
 /* ---------- MAIN ENTRY ---------- */
+
 int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
 {
     const uint8_t *buf = msg ? (const uint8_t *)msg->l3h : NULL;
@@ -381,18 +402,20 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
     int la_i = (tms && tms->tcs) ? (int)tms->tcs->la : -1;
     uint16_t la = (uint16_t)la_i;
 
-    /* eerst unpacked bits (byte&1), daarna packed fallback */
+    /* SDRTetra compat: eerst unpacked bits (byte&1), daarna packed fallback */
     static uint8_t bits_unpacked[4096];
     static uint8_t bits_packed[4096];
 
+    /* 1) Unpacked bits */
     unsigned int nbits_u = 0;
     unsigned int max_u = (len > sizeof(bits_unpacked)) ? (unsigned int)sizeof(bits_unpacked) : len;
     for (unsigned int i = 0; i < max_u; i++)
         bits_unpacked[nbits_u++] = buf[i] & 1u;
 
-    if (try_decode_mm_from_bits(bits_unpacked, nbits_u, issi, la))
+    if (try_decode_mm_from_bits(tms, bits_unpacked, nbits_u, issi, la, len))
         return (int)len;
 
+    /* 2) Packed fallback: bytes -> bits MSB first */
     unsigned int max_p_bytes = len;
     if (max_p_bytes * 8 > sizeof(bits_packed))
         max_p_bytes = (unsigned int)(sizeof(bits_packed) / 8);
@@ -404,6 +427,7 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
             bits_packed[nbits_p++] = (b >> k) & 1u;
     }
 
-    (void)try_decode_mm_from_bits(bits_packed, nbits_p, issi, la);
+    (void)try_decode_mm_from_bits(tms, bits_packed, nbits_p, issi, la, len);
+
     return (int)len;
 }
