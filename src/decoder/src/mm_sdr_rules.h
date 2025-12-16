@@ -22,6 +22,13 @@ extern "C" {
 #define GN_Group_identity_report 392
 #define GN_MM_SSI 397
 
+/* Additional MM fields used by SDR# Class18 rules_4 / rules_5 */
+#define GN_Group_identity_acknowledgement_request 408
+#define GN_Group_identity_attach_detach_mode 409
+
+/* Used by rules_5 (Attach/Detach Group Identity Ack) */
+#define GN_Group_identity_accept_reject 384
+
 /* Subset of SDR# RulesType */
 typedef enum {
     MMRT_Direct = 0,
@@ -59,11 +66,20 @@ unsigned int mm_rules_decode(const uint8_t *bits, unsigned int nbits,
 extern const mm_rule mm_rules_loc_upd_accept[];
 extern const size_t  mm_rules_loc_upd_accept_count;
 
+extern const mm_rule mm_rules_loc_upd_command[];
+extern const size_t  mm_rules_loc_upd_command_count;
+
 extern const mm_rule mm_rules_loc_upd_proceeding[];
 extern const size_t  mm_rules_loc_upd_proceeding_count;
 
 extern const mm_rule mm_rules_loc_upd_reject[];
 extern const size_t  mm_rules_loc_upd_reject_count;
+
+extern const mm_rule mm_rules_att_det_group_id[];
+extern const size_t  mm_rules_att_det_group_id_count;
+
+extern const mm_rule mm_rules_att_det_group_id_ack[];
+extern const size_t  mm_rules_att_det_group_id_ack_count;
 
 #ifdef __cplusplus
 }

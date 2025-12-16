@@ -497,6 +497,16 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
 
             /* ===== SDR#-style MM decode (rules engine) ===== */
 
+            if (type == TMM_PDU_T_D_LOC_UPD_CMD) {
+                unsigned int payload_start = toff + 4;
+                mm_field_store fs = {0};
+                (void)mm_rules_decode(bits, nbits, payload_start,
+                                      mm_rules_loc_upd_command, mm_rules_loc_upd_command_count,
+                                      &fs);
+                mm_logf_ctx(issi, (uint16_t)la, "SwMI sent LOCATION UPDATE COMMAND for SSI: %u", (unsigned)issi);
+                return (int)len;
+            }
+
             if (type == TMM_PDU_T_D_LOC_UPD_PROC) {
                 unsigned int payload_start = toff + 4;
                 mm_field_store fs = {0};
@@ -517,6 +527,26 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
                 mm_logf_ctx(issi, (uint16_t)la, "SwMI sent LOCATION UPDATE REJECT for SSI: %u (cause=%u)",
                             (unsigned)issi,
                             (unsigned)(fs.present[GN_Reject_cause] ? fs.value[GN_Reject_cause] : 0));
+                return (int)len;
+            }
+
+            if (type == TMM_PDU_T_D_ATT_DET_GRP) {
+                unsigned int payload_start = toff + 4;
+                mm_field_store fs = {0};
+                (void)mm_rules_decode(bits, nbits, payload_start,
+                                      mm_rules_att_det_group_id, mm_rules_att_det_group_id_count,
+                                      &fs);
+                mm_logf_ctx(issi, (uint16_t)la, "SwMI sent ATTACH/DETACH GROUP IDENTITY for SSI: %u", (unsigned)issi);
+                return (int)len;
+            }
+
+            if (type == TMM_PDU_T_D_ATT_DET_GRP_ACK) {
+                unsigned int payload_start = toff + 4;
+                mm_field_store fs = {0};
+                (void)mm_rules_decode(bits, nbits, payload_start,
+                                      mm_rules_att_det_group_id_ack, mm_rules_att_det_group_id_ack_count,
+                                      &fs);
+                mm_logf_ctx(issi, (uint16_t)la, "SwMI sent ATTACH/DETACH GROUP IDENTITY ACK for SSI: %u", (unsigned)issi);
                 return (int)len;
             }
 
