@@ -54,119 +54,6 @@ static void add_gssi_to_list(uint32_t gssi, uint32_t *list, uint8_t *count, uint
         list[(*count)++] = gssi;
 }
 
-/* --- MM IE (TLV) parsing helpers ---------------------------------------
- * SDR# gebruikt een rule-engine (presence/optional/switch) om MM velden te decoderen.
- * In de praktijk betekent dat: na PDISC/MM-type volgt meestal een reeks IE's (octet-gebaseerd),
- * met optionele velden die je NIET op vaste bitposities mag lezen.
- *
- * Deze helpers geven ons een robuuste baseline:
- *  - Start op een octet boundary
- *  - Lees IEI (8) + LEN (8) + DATA(LEN*8)
- *  - Log onbekende IE's (handig debuggen)
- *  - Heuristiek: 24-bit waarden (len==3) behandelen als kandidaat SSI/GSSI
- *    (veel MM IE's gebruiken 24-bit SSI/GSSI of lijsten daarvan)
- */
-
-static unsigned int align_to_octet(unsigned int bitoff)
-{
-    return (bitoff + 7u) & ~7u;
-}
-
-static uint8_t get_u8_aligned(const uint8_t *bits, unsigned int nbits, unsigned int bitoff)
-{
-    /* bitoff moet op octet boundary zitten */
-    return (uint8_t)get_bits(bits, nbits, bitoff, 8);
-}
-
-static uint32_t get_u24_aligned(const uint8_t *bits, unsigned int nbits, unsigned int bitoff)
-{
-    return (uint32_t)get_bits(bits, nbits, bitoff, 24);
-}
-
-static void hex_snip(char *out, size_t out_sz, const uint8_t *bits, unsigned int nbits,
-                     unsigned int bitoff, unsigned int nbytes, unsigned int max_bytes)
-{
-    /* Zet een stukje data om naar hex (max_bytes), voor logging/debugging */
-    if (!out || out_sz == 0) return;
-    out[0] = '\0';
-
-    unsigned int show = (nbytes > max_bytes) ? max_bytes : nbytes;
-    size_t pos = 0;
-    for (unsigned int i = 0; i < show; i++) {
-        if (bitoff + (i+1u)*8u > nbits) break;
-        uint8_t b = get_u8_aligned(bits, nbits, bitoff + i*8u);
-        int w = snprintf(out + pos, (pos < out_sz) ? (out_sz - pos) : 0, "%02X", b);
-        if (w < 0) break;
-        pos += (size_t)w;
-        if (i + 1 < show) {
-            if (pos + 1 < out_sz) { out[pos++] = ' '; out[pos] = '\0'; }
-        }
-    }
-    if (nbytes > show && pos + 4 < out_sz) {
-        snprintf(out + pos, out_sz - pos, " ...");
-    }
-}
-
-/* Parse TLV IE's uit een MM PDU payload.
- * - payload_bitoff: start van IE stream (liefst aligned)
- * - payload_bitlen: totale lengte in bits vanaf payload_bitoff
- *
- * Outputs:
- * - vult eventueel GSSI lijst/een enkele GSSI via heuristiek (len==3)
- * - kan LA kandidaten herkennen (len==2 en <= 14 bits)
- */
-static void mm_parse_tlv_ies(const uint8_t *bits, unsigned int nbits,
-                            uint32_t issi, int la, uint8_t mm_type,
-                            unsigned int payload_bitoff, unsigned int payload_bitlen,
-                            uint32_t *out_gssi, int *out_have_gssi,
-                            uint32_t *out_gssi_list, uint8_t *out_gssi_count, uint8_t out_gssi_max,
-                            uint16_t *out_la_candidate, int *out_have_la_candidate)
-{
-    unsigned int off = align_to_octet(payload_bitoff);
-    unsigned int end = payload_bitoff + payload_bitlen;
-    if (end > nbits) end = nbits;
-
-    /* Loop IEI/LEN/DATA */
-    while (off + 16u <= end) {
-        uint8_t iei = get_u8_aligned(bits, nbits, off);
-        uint8_t len = get_u8_aligned(bits, nbits, off + 8u);
-        off += 16u;
-
-        unsigned int data_bits = (unsigned int)len * 8u;
-        if (off + data_bits > end) break;
-
-        /* Heuristieken voor veel voorkomende velden */
-        if (len == 3) {
-            uint32_t v = get_u24_aligned(bits, nbits, off);
-            /* Dit kan SSI of GSSI zijn. In praktijk wil je vooral GSSI's zien. */
-            add_gssi_to_list(v, out_gssi_list, out_gssi_count, out_gssi_max);
-            if (out_gssi && out_have_gssi && !*out_have_gssi) {
-                *out_gssi = v;
-                *out_have_gssi = 1;
-            }
-        } else if (len == 2) {
-            uint16_t v16 = (uint16_t)get_bits(bits, nbits, off, 16);
-            /* LA is 14 bits; veel implementaties sturen het als 2 octets met leading zeros */
-            if (v16 <= 0x3FFFu && out_la_candidate && out_have_la_candidate && !*out_have_la_candidate) {
-                *out_la_candidate = v16;
-                *out_have_la_candidate = 1;
-            }
-        }
-
-        /* Debug logging: laat onbekende IE's zien om mapping te kunnen toevoegen */
-        {
-            char hx[128];
-            hex_snip(hx, sizeof(hx), bits, nbits, off, len, 10);
-            mm_logf_ctx(issi, (uint16_t)la, "MM type=0x%X IEI=0x%02X len=%u data=%s",
-                        (unsigned)mm_type, (unsigned)iei, (unsigned)len, hx);
-        }
-
-        off += data_bits;
-        /* Sommige stacks voegen padding toe tot octet boundary: forceer aligned */
-        off = align_to_octet(off);
-    }
-}
-
 /* ---------- Type-3/4 element parsing ---------- */
 
 /*
@@ -326,6 +213,173 @@ static int find_first_type34(const uint8_t *bits, unsigned int nbits, unsigned i
     return -1;
 }
 
+
+/* ---------- Octet/TLV helpers (SDR#-style optional IE parsing) ---------- */
+
+/* Read 1 octet from bitstream at bit offset 'boff' (must be <= nbits-8) */
+static inline uint8_t get_octet(const uint8_t *bits, unsigned int nbits, unsigned int boff)
+{
+    return (uint8_t)get_bits(bits, nbits, boff, 8);
+}
+
+/* Dump a few bytes starting at aligned offset (for debugging) */
+static void mm_dump_payload_hex(uint32_t issi, uint16_t la,
+                                const uint8_t *bits, unsigned int nbits,
+                                unsigned int start_boff, unsigned int max_bytes)
+{
+    if (!bits || start_boff >= nbits)
+        return;
+
+    unsigned int boff = (start_boff + 7u) & ~7u; /* round up to octet */
+    unsigned int avail_bytes = (nbits > boff) ? (nbits - boff) / 8u : 0u;
+    if (avail_bytes == 0)
+        return;
+
+    if (max_bytes > avail_bytes)
+        max_bytes = avail_bytes;
+
+    char line[3 * 160 + 1];
+    unsigned int n = 0;
+    for (unsigned int i = 0; i < max_bytes && n + 3 < sizeof(line); i++) {
+        uint8_t b = get_octet(bits, nbits, boff + i * 8u);
+        n += (unsigned int)snprintf(line + n, sizeof(line) - n, "%02X%s", b, (i + 1 < max_bytes) ? " " : "");
+    }
+    line[sizeof(line) - 1] = 0;
+    mm_logf_ctx(issi, la, "MM raw payload (from bit %u): %s", boff, line);
+}
+
+static void mm_try_extract_cck_from_iei54(const uint8_t *data, unsigned int len,
+                                         uint8_t *cck_id, uint8_t *have_cck)
+{
+    /* Observed in your log: IEI 0x54 len=9 where CCK_identifier=63.
+       The last two bytes often carry a 6-bit CCK id spanning a bit boundary:
+          cck_id = ((b[len-2] >> 7) << 5) | (b[len-1] & 0x1F)
+       For: ... 0x80 0x1F -> 0b1_11111 -> 63
+    */
+    if (!data || len < 2 || !cck_id || !have_cck)
+        return;
+    uint8_t b7 = data[len - 2];
+    uint8_t b8 = data[len - 1];
+    uint8_t cid = (uint8_t)(((b7 >> 7) & 0x01) << 5) | (uint8_t)(b8 & 0x1F);
+    *cck_id = cid;
+    *have_cck = 1;
+}
+
+/* Roaming / location updating type heuristics from observed IEI 0x09 len=1 (data=0x80) */
+static void mm_try_extract_roam_from_iei09(const uint8_t *data, unsigned int len,
+                                          uint8_t *roam, uint8_t *have_roam)
+{
+    if (!data || len < 1 || !roam || !have_roam)
+        return;
+    uint8_t v = data[0];
+
+    /* Empirical mapping (seen on ASTRID-style nets):
+       0x80 -> Roaming location updating
+       0xC0 -> Service restoration roaming location updating
+       else -> keep raw for later refinement
+    */
+    if (v == 0x80)
+        *roam = 1;
+    else if (v == 0xC0)
+        *roam = 2;
+    else
+        *roam = v;
+
+    *have_roam = 1;
+}
+
+/* Scan a byte buffer for 24-bit values that could be GSSI (very helpful while reverse-engineering IE layout) */
+static void mm_scan_for_gssi_candidates(uint32_t issi,
+                                        const uint8_t *data, unsigned int len,
+                                        uint32_t *out_list, uint8_t *io_count, uint8_t max_count)
+{
+    if (!data || len < 3 || !out_list || !io_count || max_count == 0)
+        return;
+
+    for (unsigned int i = 0; i + 2 < len; i++) {
+        uint32_t v = ((uint32_t)data[i] << 16) | ((uint32_t)data[i + 1] << 8) | (uint32_t)data[i + 2];
+        if (v == 0 || v == issi)
+            continue;
+
+        /* Filter: ignore very small values that are likely flags, keep mid/high 24-bit values (group SSI often lives here) */
+        if (v < 100000) /* tweakable */
+            continue;
+
+        /* de-dup */
+        uint8_t exists = 0;
+        for (uint8_t k = 0; k < *io_count; k++) {
+            if (out_list[k] == v) { exists = 1; break; }
+        }
+        if (!exists) {
+            out_list[*io_count] = v;
+            (*io_count)++;
+            if (*io_count >= max_count)
+                return;
+        }
+    }
+}
+
+/* Parse simple IEI/LEN/DATA octet TLVs starting at (rounded-up) bit offset. */
+static void mm_parse_octet_tlvs(uint32_t issi, uint16_t la,
+                                const uint8_t *bits, unsigned int nbits,
+                                unsigned int start_boff,
+                                uint32_t *gssi_list, uint8_t *gssi_count, uint8_t gssi_max,
+                                uint8_t *cck_id, uint8_t *have_cck,
+                                uint8_t *roam, uint8_t *have_roam)
+{
+    if (!bits || start_boff >= nbits)
+        return;
+
+    unsigned int boff = (start_boff + 7u) & ~7u;
+    unsigned int avail = (nbits > boff) ? (nbits - boff) / 8u : 0u;
+
+    /* Safety: don't run forever on garbage */
+    unsigned int i = 0;
+    while (i + 2 <= avail) {
+        uint8_t iei = get_octet(bits, nbits, boff + i * 8u);
+        uint8_t len = get_octet(bits, nbits, boff + (i + 1) * 8u);
+        i += 2;
+
+        if (i + len > avail) {
+            mm_logf_ctx(issi, la, "MM TLV parse stopped (IEI=0x%02X len=%u overruns payload)", iei, (unsigned)len);
+            break;
+        }
+
+        /* Collect data bytes */
+        uint8_t tmp[255];
+        unsigned int l = (len > sizeof(tmp)) ? sizeof(tmp) : len;
+        for (unsigned int j = 0; j < l; j++)
+            tmp[j] = get_octet(bits, nbits, boff + (i + j) * 8u);
+
+        /* Log TLV (matches your logfile style) */
+        {
+            char hex[3 * 96 + 1];
+            unsigned int hn = 0;
+            unsigned int show = (l > 96) ? 96 : l;
+            for (unsigned int j = 0; j < show && hn + 3 < sizeof(hex); j++) {
+                hn += (unsigned int)snprintf(hex + hn, sizeof(hex) - hn, "%02X%s", tmp[j], (j + 1 < show) ? " " : "");
+            }
+            hex[sizeof(hex) - 1] = 0;
+            mm_logf_ctx(issi, la, "MM TLV IEI=0x%02X len=%u data=%s", iei, (unsigned)len, (show ? hex : ""));
+        }
+
+        /* Heuristic decoders based on what we now see in your logs */
+        if (iei == 0x54 && len >= 2)
+            mm_try_extract_cck_from_iei54(tmp, l, cck_id, have_cck);
+        if (iei == 0x09 && len >= 1)
+            mm_try_extract_roam_from_iei09(tmp, l, roam, have_roam);
+
+        /* Search for 24-bit candidate GSSI inside this IE */
+        if (gssi_list && gssi_count)
+            mm_scan_for_gssi_candidates(issi, tmp, l, gssi_list, gssi_count, gssi_max);
+
+        i += len;
+
+        /* Some nets use IEI=0x00 / 0xFF padding; stop if we hit obvious padding with zero length repeatedly */
+        if ((iei == 0x00 || iei == 0xFF) && len == 0)
+            break;
+    }
+}
 /* ---------- Logging helpers ---------- */
 
 static void log_loc_upd_accept_like_sdrsharp(uint32_t issi, int la,
@@ -362,8 +416,16 @@ static void log_loc_upd_accept_like_sdrsharp(uint32_t issi, int la,
         snprintf(tmp, sizeof(tmp), " - CCK_identifier: %u", (unsigned)cck_id);
         strncat(tail, tmp, sizeof(tail) - strlen(tail) - 1);
     }
-    if (have_roam && roam_lu) {
-        strncat(tail, " - Roaming location updating", sizeof(tail) - strlen(tail) - 1);
+    if (have_roam) {
+        if (roam_lu == 1) {
+            strncat(tail, " - Roaming location updating", sizeof(tail) - strlen(tail) - 1);
+        } else if (roam_lu == 2) {
+            strncat(tail, " - Service restoration roaming location updating", sizeof(tail) - strlen(tail) - 1);
+        } else if (roam_lu) {
+            char tmp2[64];
+            snprintf(tmp2, sizeof(tmp2), " - Roam/LU flags: 0x%02X", (unsigned)roam_lu);
+            strncat(tail, tmp2, sizeof(tail) - strlen(tail) - 1);
+        }
     }
 
     if (gssi_count > 0) {
@@ -435,28 +497,6 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
 
             uint8_t type = (uint8_t)get_bits(bits, nbits, toff, 4);
 
-            /* Payload start: na type veld (en evt. spare) kan er nog padding zitten.
-             * We nemen een octet-aligned start zodat TLV IE parsing stabiel blijft. */
-            unsigned int payload_off_bits = toff + 4u;
-            unsigned int payload_off_aligned = align_to_octet(payload_off_bits);
-            unsigned int payload_len_bits = (off + len) > payload_off_aligned ? (off + len - payload_off_aligned) : 0;
-
-            /* Verzamel TLV IE info voor debugging + heuristische SSI/GSSI/LA */
-            uint32_t tlv_gssi = 0;
-            int have_tlv_gssi = 0;
-            uint32_t tlv_gssi_list[16];
-            uint8_t tlv_gssi_cnt = 0;
-            uint16_t tlv_la = 0;
-            int have_tlv_la = 0;
-
-            if (payload_len_bits >= 16u) {
-                mm_parse_tlv_ies(bits, nbits, issi, la, type,
-                                 payload_off_aligned, payload_len_bits,
-                                 &tlv_gssi, &have_tlv_gssi,
-                                 tlv_gssi_list, &tlv_gssi_cnt, 16,
-                                 &tlv_la, &have_tlv_la);
-            }
-
             /* D-AUTH: subtype zit direct daarna; die logging had je al werkend */
             if (type == TMM_PDU_T_D_AUTH) {
                 if (toff + 4 + 2 <= nbits) {
@@ -499,56 +539,37 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
                                             &roam, &have_roam,
                                             &itsi_attach, &have_itsi_attach);
 
+                    /* Extra: dump and TLV/IE scan (helps match SDR# fields like GSSI/CCK/roaming on nets that don't use Type-3/4 here) */
+                    mm_dump_payload_hex(issi, (uint16_t)la, bits, nbits, scan_start, 80);
+
+                    /* Parse octet TLVs (IEI/LEN/DATA) starting after the MM type field */
+                    mm_parse_octet_tlvs(issi, (uint16_t)la, bits, nbits, scan_start,
+                                        gssi_list, &gssi_count, 8,
+                                        &cck_id, &have_cck,
+                                        &roam, &have_roam);
+
+
+
                     /* Log in SDR# stijl */
                     log_loc_upd_accept_like_sdrsharp(issi, la, gssi_list, gssi_count,
                                                      have_cck, cck_id,
                                                      have_roam, roam);
                 } else {
                     /* Geen type3/4 gevonden -> toch melden dat accept is gezien */
-                    if (have_tlv_la)
-                        mm_logf_ctx(issi, (uint16_t)la, "MS request for registration ACCEPTED (LA=%u) for SSI: %u", (unsigned)tlv_la, (unsigned)issi);
-                    else
-                        mm_logf_ctx(issi, (uint16_t)la, "MS request for registration ACCEPTED for SSI: %u", (unsigned)issi);
-                    if (have_tlv_gssi)
-                        mm_logf_ctx(issi, (uint16_t)la, "MM TLV: candidate GSSI=%u (0x%06X)", (unsigned)tlv_gssi, (unsigned)tlv_gssi);
+
+                    /* Extra: dump and TLV/IE scan even if Type-3/4 not found */
+                    mm_dump_payload_hex(issi, (uint16_t)la, bits, nbits, scan_start, 80);
+                    mm_parse_octet_tlvs(issi, (uint16_t)la, bits, nbits, scan_start,
+                                        gssi_list, &gssi_count, 8,
+                                        &cck_id, &have_cck,
+                                        &roam, &have_roam);
+
+                    mm_logf_ctx(issi, (uint16_t)la, "MS request for registration ACCEPTED for SSI: %u", (unsigned)issi);
                 }
 
                 return (int)len;
             }
 
-
-            /* D-LOCATION UPDATE COMMAND / PROCEEDING / REJECT / MM STATUS:
-             * Deze waren vaak 'stil' in jouw output. We loggen ze nu altijd,
-             * en gebruiken TLV heuristieken om o.a. LA/GSSI te tonen.
-             */
-            if (type == TMM_PDU_T_D_LOC_UPD_CMD) {
-                if (have_tlv_la)
-                    mm_logf_ctx(issi, (uint16_t)la, "SwMI sent LOCATION UPDATE COMMAND (new LA=%u) for SSI: %u", (unsigned)tlv_la, (unsigned)issi);
-                else
-                    mm_logf_ctx(issi, (uint16_t)la, "SwMI sent LOCATION UPDATE COMMAND for SSI: %u", (unsigned)issi);
-                if (have_tlv_gssi)
-                    mm_logf_ctx(issi, (uint16_t)la, "MM TLV: candidate GSSI=%u (0x%06X)", (unsigned)tlv_gssi, (unsigned)tlv_gssi);
-                return (int)len;
-            }
-
-            if (type == TMM_PDU_T_D_LOC_UPD_PROC) {
-                if (have_tlv_la)
-                    mm_logf_ctx(issi, (uint16_t)la, "SwMI sent LOCATION UPDATE PROCEEDING (LA=%u) for SSI: %u", (unsigned)tlv_la, (unsigned)issi);
-                else
-                    mm_logf_ctx(issi, (uint16_t)la, "SwMI sent LOCATION UPDATE PROCEEDING for SSI: %u", (unsigned)issi);
-                return (int)len;
-            }
-
-            if (type == TMM_PDU_T_D_LOC_UPD_REJ) {
-                /* reject cause is vaak 5 bits; sommige implementaties stoppen 'm in 1 octet */
-                mm_logf_ctx(issi, (uint16_t)la, "SwMI sent LOCATION UPDATE REJECT for SSI: %u", (unsigned)issi);
-                return (int)len;
-            }
-
-            if (type == TMM_PDU_T_D_MM_STATUS) {
-                mm_logf_ctx(issi, (uint16_t)la, "MM STATUS for SSI: %u", (unsigned)issi);
-                return (int)len;
-            }
             /* Andere MM types kun je later toevoegen (LOC_UPD_PROC, LOC_UPD_REJ, ...). */
         }
     }
