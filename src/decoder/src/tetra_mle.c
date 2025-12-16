@@ -296,6 +296,12 @@ static void mm_scan_type34_elements(const uint8_t *bits, unsigned int bitlen, un
 
     while (pos + 16u <= bitlen) {
         uint32_t mbit = get_bits(bits, bitlen, pos, 1);
+
+                /* SDR# toont bij 'ITSI attach' geen GSSI; behoud hetzelfde gedrag */
+                if (have_itsi_attach && itsi_attach) {
+                    have_gssi = 0;
+                }
+
         if (mbit == 0)
             break; /* geen elementen meer */
 
@@ -677,6 +683,17 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
             uint32_t gssi = 0;
             uint8_t have_gssi = 0;
 
+            /* In SDR# rules_0 heet dit veld MM_SSI maar het is de 24-bit (G)SSI die SDR# als GSSI logt. */
+            if (fs.present[GN_MM_SSI]) {
+                uint32_t tmp = fs.value[GN_MM_SSI];
+                /* Plausibility: filter obvious false positives */
+                if (tmp == 0xFFFFFFu || (tmp >= 1000000u && tmp <= 9000000u)) {
+                    gssi = tmp;
+                    have_gssi = 1;
+                }
+            }
+
+
             if (t34 >= 0) {
                 mm_scan_type34_elements(bits, nbits, (unsigned int)t34,
                                         &gssi, &have_gssi,
@@ -684,10 +701,15 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
                                         &cck_id, &have_cck,
                                         &roam, &have_roam,
                                         &itsi_attach, &have_itsi_attach);
+
+                /* SDR# toont bij 'ITSI attach' geen GSSI; behoud hetzelfde gedrag */
+                if (have_itsi_attach && itsi_attach) {
+                    have_gssi = 0;
+                }
+
             }
 
             uint32_t ssi_out = issi;
-            if (fs.present[GN_MM_SSI]) ssi_out = fs.value[GN_MM_SSI];
 
             if (gssi_count > 0) {
                 char gbuf[128]; gbuf[0] = 0;
