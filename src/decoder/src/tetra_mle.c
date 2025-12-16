@@ -54,6 +54,119 @@ static void add_gssi_to_list(uint32_t gssi, uint32_t *list, uint8_t *count, uint
         list[(*count)++] = gssi;
 }
 
+/* --- MM IE (TLV) parsing helpers ---------------------------------------
+ * SDR# gebruikt een rule-engine (presence/optional/switch) om MM velden te decoderen.
+ * In de praktijk betekent dat: na PDISC/MM-type volgt meestal een reeks IE's (octet-gebaseerd),
+ * met optionele velden die je NIET op vaste bitposities mag lezen.
+ *
+ * Deze helpers geven ons een robuuste baseline:
+ *  - Start op een octet boundary
+ *  - Lees IEI (8) + LEN (8) + DATA(LEN*8)
+ *  - Log onbekende IE's (handig debuggen)
+ *  - Heuristiek: 24-bit waarden (len==3) behandelen als kandidaat SSI/GSSI
+ *    (veel MM IE's gebruiken 24-bit SSI/GSSI of lijsten daarvan)
+ */
+
+static unsigned int align_to_octet(unsigned int bitoff)
+{
+    return (bitoff + 7u) & ~7u;
+}
+
+static uint8_t get_u8_aligned(const uint8_t *bits, unsigned int nbits, unsigned int bitoff)
+{
+    /* bitoff moet op octet boundary zitten */
+    return (uint8_t)get_bits(bits, nbits, bitoff, 8);
+}
+
+static uint32_t get_u24_aligned(const uint8_t *bits, unsigned int nbits, unsigned int bitoff)
+{
+    return (uint32_t)get_bits(bits, nbits, bitoff, 24);
+}
+
+static void hex_snip(char *out, size_t out_sz, const uint8_t *bits, unsigned int nbits,
+                     unsigned int bitoff, unsigned int nbytes, unsigned int max_bytes)
+{
+    /* Zet een stukje data om naar hex (max_bytes), voor logging/debugging */
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+
+    unsigned int show = (nbytes > max_bytes) ? max_bytes : nbytes;
+    size_t pos = 0;
+    for (unsigned int i = 0; i < show; i++) {
+        if (bitoff + (i+1u)*8u > nbits) break;
+        uint8_t b = get_u8_aligned(bits, nbits, bitoff + i*8u);
+        int w = snprintf(out + pos, (pos < out_sz) ? (out_sz - pos) : 0, "%02X", b);
+        if (w < 0) break;
+        pos += (size_t)w;
+        if (i + 1 < show) {
+            if (pos + 1 < out_sz) { out[pos++] = ' '; out[pos] = '\0'; }
+        }
+    }
+    if (nbytes > show && pos + 4 < out_sz) {
+        snprintf(out + pos, out_sz - pos, " ...");
+    }
+}
+
+/* Parse TLV IE's uit een MM PDU payload.
+ * - payload_bitoff: start van IE stream (liefst aligned)
+ * - payload_bitlen: totale lengte in bits vanaf payload_bitoff
+ *
+ * Outputs:
+ * - vult eventueel GSSI lijst/een enkele GSSI via heuristiek (len==3)
+ * - kan LA kandidaten herkennen (len==2 en <= 14 bits)
+ */
+static void mm_parse_tlv_ies(const uint8_t *bits, unsigned int nbits,
+                            uint32_t issi, int la, uint8_t mm_type,
+                            unsigned int payload_bitoff, unsigned int payload_bitlen,
+                            uint32_t *out_gssi, int *out_have_gssi,
+                            uint32_t *out_gssi_list, uint8_t *out_gssi_count, uint8_t out_gssi_max,
+                            uint16_t *out_la_candidate, int *out_have_la_candidate)
+{
+    unsigned int off = align_to_octet(payload_bitoff);
+    unsigned int end = payload_bitoff + payload_bitlen;
+    if (end > nbits) end = nbits;
+
+    /* Loop IEI/LEN/DATA */
+    while (off + 16u <= end) {
+        uint8_t iei = get_u8_aligned(bits, nbits, off);
+        uint8_t len = get_u8_aligned(bits, nbits, off + 8u);
+        off += 16u;
+
+        unsigned int data_bits = (unsigned int)len * 8u;
+        if (off + data_bits > end) break;
+
+        /* Heuristieken voor veel voorkomende velden */
+        if (len == 3) {
+            uint32_t v = get_u24_aligned(bits, nbits, off);
+            /* Dit kan SSI of GSSI zijn. In praktijk wil je vooral GSSI's zien. */
+            add_gssi_to_list(v, out_gssi_list, out_gssi_count, out_gssi_max);
+            if (out_gssi && out_have_gssi && !*out_have_gssi) {
+                *out_gssi = v;
+                *out_have_gssi = 1;
+            }
+        } else if (len == 2) {
+            uint16_t v16 = (uint16_t)get_bits(bits, nbits, off, 16);
+            /* LA is 14 bits; veel implementaties sturen het als 2 octets met leading zeros */
+            if (v16 <= 0x3FFFu && out_la_candidate && out_have_la_candidate && !*out_have_la_candidate) {
+                *out_la_candidate = v16;
+                *out_have_la_candidate = 1;
+            }
+        }
+
+        /* Debug logging: laat onbekende IE's zien om mapping te kunnen toevoegen */
+        {
+            char hx[128];
+            hex_snip(hx, sizeof(hx), bits, nbits, off, len, 10);
+            mm_logf_ctx(issi, (uint16_t)la, "MM type=0x%X IEI=0x%02X len=%u data=%s",
+                        (unsigned)mm_type, (unsigned)iei, (unsigned)len, hx);
+        }
+
+        off += data_bits;
+        /* Sommige stacks voegen padding toe tot octet boundary: forceer aligned */
+        off = align_to_octet(off);
+    }
+}
+
 /* ---------- Type-3/4 element parsing ---------- */
 
 /*
@@ -322,6 +435,28 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
 
             uint8_t type = (uint8_t)get_bits(bits, nbits, toff, 4);
 
+            /* Payload start: na type veld (en evt. spare) kan er nog padding zitten.
+             * We nemen een octet-aligned start zodat TLV IE parsing stabiel blijft. */
+            unsigned int payload_off_bits = toff + 4u;
+            unsigned int payload_off_aligned = align_to_octet(payload_off_bits);
+            unsigned int payload_len_bits = (off + len) > payload_off_aligned ? (off + len - payload_off_aligned) : 0;
+
+            /* Verzamel TLV IE info voor debugging + heuristische SSI/GSSI/LA */
+            uint32_t tlv_gssi = 0;
+            int have_tlv_gssi = 0;
+            uint32_t tlv_gssi_list[16];
+            uint8_t tlv_gssi_cnt = 0;
+            uint16_t tlv_la = 0;
+            int have_tlv_la = 0;
+
+            if (payload_len_bits >= 16u) {
+                mm_parse_tlv_ies(bits, nbits, issi, la, type,
+                                 payload_off_aligned, payload_len_bits,
+                                 &tlv_gssi, &have_tlv_gssi,
+                                 tlv_gssi_list, &tlv_gssi_cnt, 16,
+                                 &tlv_la, &have_tlv_la);
+            }
+
             /* D-AUTH: subtype zit direct daarna; die logging had je al werkend */
             if (type == TMM_PDU_T_D_AUTH) {
                 if (toff + 4 + 2 <= nbits) {
@@ -370,12 +505,50 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
                                                      have_roam, roam);
                 } else {
                     /* Geen type3/4 gevonden -> toch melden dat accept is gezien */
-                    mm_logf_ctx(issi, (uint16_t)la, "MS request for registration ACCEPTED for SSI: %u", (unsigned)issi);
+                    if (have_tlv_la)
+                        mm_logf_ctx(issi, (uint16_t)la, "MS request for registration ACCEPTED (LA=%u) for SSI: %u", (unsigned)tlv_la, (unsigned)issi);
+                    else
+                        mm_logf_ctx(issi, (uint16_t)la, "MS request for registration ACCEPTED for SSI: %u", (unsigned)issi);
+                    if (have_tlv_gssi)
+                        mm_logf_ctx(issi, (uint16_t)la, "MM TLV: candidate GSSI=%u (0x%06X)", (unsigned)tlv_gssi, (unsigned)tlv_gssi);
                 }
 
                 return (int)len;
             }
 
+
+            /* D-LOCATION UPDATE COMMAND / PROCEEDING / REJECT / MM STATUS:
+             * Deze waren vaak 'stil' in jouw output. We loggen ze nu altijd,
+             * en gebruiken TLV heuristieken om o.a. LA/GSSI te tonen.
+             */
+            if (type == TMM_PDU_T_D_LOC_UPD_CMD) {
+                if (have_tlv_la)
+                    mm_logf_ctx(issi, (uint16_t)la, "SwMI sent LOCATION UPDATE COMMAND (new LA=%u) for SSI: %u", (unsigned)tlv_la, (unsigned)issi);
+                else
+                    mm_logf_ctx(issi, (uint16_t)la, "SwMI sent LOCATION UPDATE COMMAND for SSI: %u", (unsigned)issi);
+                if (have_tlv_gssi)
+                    mm_logf_ctx(issi, (uint16_t)la, "MM TLV: candidate GSSI=%u (0x%06X)", (unsigned)tlv_gssi, (unsigned)tlv_gssi);
+                return (int)len;
+            }
+
+            if (type == TMM_PDU_T_D_LOC_UPD_PROC) {
+                if (have_tlv_la)
+                    mm_logf_ctx(issi, (uint16_t)la, "SwMI sent LOCATION UPDATE PROCEEDING (LA=%u) for SSI: %u", (unsigned)tlv_la, (unsigned)issi);
+                else
+                    mm_logf_ctx(issi, (uint16_t)la, "SwMI sent LOCATION UPDATE PROCEEDING for SSI: %u", (unsigned)issi);
+                return (int)len;
+            }
+
+            if (type == TMM_PDU_T_D_LOC_UPD_REJ) {
+                /* reject cause is vaak 5 bits; sommige implementaties stoppen 'm in 1 octet */
+                mm_logf_ctx(issi, (uint16_t)la, "SwMI sent LOCATION UPDATE REJECT for SSI: %u", (unsigned)issi);
+                return (int)len;
+            }
+
+            if (type == TMM_PDU_T_D_MM_STATUS) {
+                mm_logf_ctx(issi, (uint16_t)la, "MM STATUS for SSI: %u", (unsigned)issi);
+                return (int)len;
+            }
             /* Andere MM types kun je later toevoegen (LOC_UPD_PROC, LOC_UPD_REJ, ...). */
         }
     }
