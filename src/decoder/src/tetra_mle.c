@@ -39,6 +39,152 @@ static uint32_t get_bits(const uint8_t *bits, unsigned int len, unsigned int pos
         val = (val << 1) | (bits[pos + i] & 1u);
     return val;
 }
+/* ===================== MM DEBUG BITDUMP (SDR#-style tracing) ===================== */
+
+/* Set to 1 for verbose bit/hex dumps to diagnose alignment + locate GSSI/CCK/flags */
+#ifndef MM_DEBUG_BITS
+#define MM_DEBUG_BITS 1
+#endif
+
+#if MM_DEBUG_BITS
+
+static unsigned int mm_bits_to_bytes_from(const uint8_t *bits, unsigned int nbits,
+                                         unsigned int start_bit, uint8_t *out, unsigned int out_max)
+{
+    if (!bits || !out || out_max == 0 || start_bit >= nbits) return 0;
+    unsigned int bitpos = start_bit;
+    unsigned int o = 0;
+    while (bitpos + 8 <= nbits && o < out_max) {
+        out[o++] = (uint8_t)get_bits(bits, nbits, bitpos, 8);
+        bitpos += 8;
+    }
+    return o;
+}
+
+static void mm_hex_dump_ctx(uint32_t issi, uint16_t la, const char *label,
+                            const uint8_t *buf, unsigned int len)
+{
+    if (!buf || len == 0) {
+        mm_logf_ctx(issi, la, "%s: <empty>", label ? label : "dump");
+        return;
+    }
+    char line[1400];
+    unsigned int p = 0;
+    p += (unsigned int)snprintf(line + p, sizeof(line) - p, "%s:", label ? label : "dump");
+    for (unsigned int i = 0; i < len && p + 4 < sizeof(line); i++) {
+        p += (unsigned int)snprintf(line + p, sizeof(line) - p, " %02X", (unsigned)buf[i]);
+    }
+    mm_logf_ctx(issi, la, "%s", line);
+}
+
+static void mm_bit_dump_ctx(uint32_t issi, uint16_t la, const char *label,
+                            const uint8_t *bits, unsigned int nbits,
+                            unsigned int start_bit, unsigned int nshow_bits)
+{
+    if (!bits || start_bit >= nbits) return;
+    if (start_bit + nshow_bits > nbits) nshow_bits = nbits - start_bit;
+
+    char line[1600];
+    unsigned int p = 0;
+    p += (unsigned int)snprintf(line + p, sizeof(line) - p, "%s @bit%u (%u bits): ",
+                                label ? label : "bits", start_bit, nshow_bits);
+
+    /* print grouped: 3 | 1 | 4 | (rest octets) */
+    for (unsigned int i = 0; i < nshow_bits && p + 3 < sizeof(line); i++) {
+        /* separators: after 3,4,8,16... */
+        if (i == 3 || i == 4 || i == 8 || (i > 0 && (i % 8) == 0))
+            p += (unsigned int)snprintf(line + p, sizeof(line) - p, " ");
+        line[p++] = bits[start_bit + i] ? '1' : '0';
+    }
+    line[p] = 0;
+    mm_logf_ctx(issi, la, "%s", line);
+}
+
+static void mm_scan_24bit_candidates_ctx(uint32_t issi, uint16_t la,
+                                        const uint8_t *buf, unsigned int len,
+                                        unsigned int base_bit)
+{
+    if (!buf || len < 3) return;
+    for (unsigned int i = 0; i + 2 < len; i++) {
+        uint32_t v = ((uint32_t)buf[i] << 16) | ((uint32_t)buf[i+1] << 8) | (uint32_t)buf[i+2];
+        if (v >= 1000000 && v <= 9000000) {
+            mm_logf_ctx(issi, la,
+                        "MM 24-bit candidate at byte+%u (bit+%u): %u (0x%06X) bytes=%02X %02X %02X",
+                        i, base_bit + i*8, (unsigned)v, (unsigned)v,
+                        (unsigned)buf[i], (unsigned)buf[i+1], (unsigned)buf[i+2]);
+        }
+    }
+}
+
+/* Find plausible Type-3/4 headers (M=1, TID, LI) and print them for context. */
+static void mm_scan_type34_headers_ctx(uint32_t issi, uint16_t la,
+                                      const uint8_t *bits, unsigned int nbits,
+                                      unsigned int start_bit, unsigned int window_bits)
+{
+    if (!bits || start_bit >= nbits) return;
+    unsigned int end = start_bit + window_bits;
+    if (end > nbits) end = nbits;
+
+    for (unsigned int pos = start_bit; pos + 16u <= end; pos++) {
+        if (get_bits(bits, nbits, pos, 1) != 1) continue;
+        uint32_t tid = get_bits(bits, nbits, pos + 1, 4);
+        uint32_t li  = get_bits(bits, nbits, pos + 5, 11);
+        if (li == 0 || li > 1024) continue;
+        if (pos + 16u + (unsigned int)li > nbits) continue;
+
+        /* restrict to interesting tids to avoid log spam */
+        if (!(tid == 0x2 || tid == 0x5 || tid == 0x6 || tid == 0x7)) continue;
+
+        mm_logf_ctx(issi, la, "MM Type3/4 header at bit%u: M=1 TID=0x%X LI=%u (ends bit%u)",
+                    pos, (unsigned)tid, (unsigned)li, pos + 16u + (unsigned)li);
+    }
+}
+
+/* Main debug hook: show offsets + bit/hex windows for candidate MM PDUs */
+static void mm_debug_dump_mm_ctx(uint32_t issi, uint16_t la,
+                                 const uint8_t *bits, unsigned int nbits,
+                                 unsigned int pdisc_off)
+{
+    if (!bits || pdisc_off >= nbits) return;
+
+    uint8_t pdisc = (uint8_t)get_bits(bits, nbits, pdisc_off, 3);
+    /* try multiple type offsets like the decoder */
+    unsigned int type_offsets[4] = { pdisc_off + 3, pdisc_off + 4, pdisc_off + 5, pdisc_off + 6 };
+
+    mm_logf_ctx(issi, la, "MM DEBUG: pdisc_off=%u PDISC=%u", pdisc_off, (unsigned)pdisc);
+
+    for (unsigned int i = 0; i < 4; i++) {
+        unsigned int toff = type_offsets[i];
+        if (toff + 4 > nbits) continue;
+        uint8_t type = (uint8_t)get_bits(bits, nbits, toff, 4);
+
+        mm_logf_ctx(issi, la, "MM DEBUG: candidate toff=%u (delta=%u) type=0x%X",
+                    toff, toff - pdisc_off, (unsigned)type);
+
+        /* bit view around pdisc/type */
+        mm_bit_dump_ctx(issi, la, "MM bits", bits, nbits, pdisc_off, 64);
+
+        /* hex views at several byte alignments after the type */
+        unsigned int after_type = toff + 4;
+        const unsigned int starts[4] = { after_type, after_type + 8, after_type + 16, after_type + 24 };
+        for (unsigned int s = 0; s < 4; s++) {
+            uint8_t tmp[80];
+            unsigned int blen = mm_bits_to_bytes_from(bits, nbits, starts[s], tmp, sizeof(tmp));
+            char lbl[64];
+            snprintf(lbl, sizeof(lbl), "MM hex from bit%u", starts[s]);
+            mm_hex_dump_ctx(issi, la, lbl, tmp, blen);
+
+            /* candidates + type3/4 headers in same window */
+            mm_scan_24bit_candidates_ctx(issi, la, tmp, blen, starts[s]);
+            mm_scan_type34_headers_ctx(issi, la, bits, nbits, starts[s], 256);
+        }
+    }
+}
+
+#endif /* MM_DEBUG_BITS */
+
+/* ===================== end MM DEBUG ===================== */
+
 
 static void add_gssi_to_list(uint32_t gssi, uint32_t *list, uint8_t *count, uint8_t max)
 {
@@ -275,6 +421,7 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
 
     uint32_t issi = tms ? (uint32_t)tms->ssi : 0;
     int la = (tms && tms->tcs) ? (int)tms->tcs->la : -1;
+    int mm_debug_done = 0;
 
     /* Detecteer packed vs unpacked */
     int is_packed = 0;
@@ -313,15 +460,26 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
         if (pdisc != TMLE_PDISC_MM)
             continue;
 
-        /* Probeer beide layouts */
-        unsigned int type_offsets[2] = { off + 3, off + 4 };
+#if MM_DEBUG_BITS
+        if (!mm_debug_done) {
+            /* Dump only once per TL-SDU to avoid log spam */
+            mm_debug_dump_mm_ctx(issi, (uint16_t)la, bits, nbits, off);
+            mm_debug_done = 1;
+        }
+#endif
 
-        for (unsigned int vi = 0; vi < 2; vi++) {
+        /* Probeer beide layouts */
+        unsigned int type_offsets[4] = { off + 3, off + 4, off + 5, off + 6 };
+
+        for (unsigned int vi = 0; vi < 4; vi++) {
             unsigned int toff = type_offsets[vi];
             if (toff + 4 > nbits)
                 continue;
 
             uint8_t type = (uint8_t)get_bits(bits, nbits, toff, 4);
+
+            /* Debug: show candidate MM type offsets (helps alignment issues) */
+            /* mm_logf_ctx(issi, (uint16_t)la, "MM candidate: off=%u toff=%u type=0x%X", off, toff, (unsigned)type); */
 
             /* D-AUTH: subtype zit direct daarna; die logging had je al werkend */
             if (type == TMM_PDU_T_D_AUTH) {
