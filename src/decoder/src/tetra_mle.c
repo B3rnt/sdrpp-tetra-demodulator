@@ -22,7 +22,11 @@ static uint32_t get_bits(const uint8_t *bits, unsigned int len, unsigned int pos
 
 /* Helper om GSSI uniek toe te voegen */
 static void add_gssi_to_list(uint32_t gssi, uint32_t *list, uint8_t *count, uint8_t max) {
-    if (!list || !count || gssi == 0 || gssi == 0xFFFFFFu) return;
+    /*
+     * NB: 0xFFFFFF wordt in ETSI-contexten gebruikt als "open" / wildcard SSI.
+     * Veel netten signaleren (G)SSI=0xFFFFFF, dus dit NIET wegfilteren.
+     */
+    if (!list || !count || gssi == 0) return;
     for (uint8_t i = 0; i < *count; i++) if (list[i] == gssi) return;
     if (*count < max) list[(*count)++] = gssi;
 }
@@ -200,7 +204,11 @@ static void handle_loc_upd_acc(uint32_t issi, uint16_t la, const uint8_t *mm_bit
     if (gssi_count > 0) {
         size_t o2 = 0;
         for (uint8_t i=0; i<gssi_count; i++) {
-            char tmp[24]; snprintf(tmp, sizeof(tmp), "%s%u", (i?",":""), gssi_list[i]);
+            char tmp[32];
+            if (gssi_list[i] == 0xFFFFFFu)
+                snprintf(tmp, sizeof(tmp), "%sOPEN(0xFFFFFF)", (i?",":""));
+            else
+                snprintf(tmp, sizeof(tmp), "%s%u", (i?",":""), gssi_list[i]);
             size_t tl = strlen(tmp);
             if(o2+tl+1 < sizeof(gbuf)) { memcpy(gbuf+o2, tmp, tl); o2+=tl; gbuf[o2]=0; }
         }
@@ -251,9 +259,13 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
      */
     int found = 0;
     
-    /* We proberen offsets 0 t/m 7 */
-    for (unsigned int off = 0; off < 8; off++) {
-        if (nbits < off + 7) break; // Hebben minstens PDISC(3)+TYPE(4) nodig
+    /*
+     * We proberen ALLE offsets (niet alleen 0..7).
+     * Bij LLC-bypass / variërende headers kan de PDISC alignment veel verder opschuiven.
+     */
+    for (unsigned int off = 0; off + 7u <= nbits; off++) {
+        /* Hebben minstens PDISC(3)+TYPE(4) nodig */
+        if (nbits < off + 7u) break;
 
         /* Check PDISC (3 bits) */
         uint8_t pdisc = (uint8_t)get_bits(bits, nbits, off, 3);
