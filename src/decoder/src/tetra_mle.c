@@ -518,6 +518,9 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
                  * zoek de eerste Type-3/4 TLV header ergens na 'type' */
                 unsigned int scan_start = toff + 4; /* na PDU-type */
 
+                /* Parsed / derived fields for this MM PDU (filled by TLV probing and/or type3/4 scan) */
+
+
                 /* --- SDR#-achtige octet/TLV probing (lost 'bit offset' en format-switch issues op) --- */
                 {
                     const unsigned int probe_offsets[4] = { 0, 8, 16, 24 };
