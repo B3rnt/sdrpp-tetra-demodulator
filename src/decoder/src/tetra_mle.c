@@ -189,8 +189,17 @@ static void mm_debug_dump_mm_ctx(uint32_t issi, uint16_t la,
 
 static void add_gssi_to_list(uint32_t gssi, uint32_t *list, uint8_t *count, uint8_t max)
 {
-    /* 0xFFFFFF is "open" SSI in ETSI context (veel netten sturen dit). Niet wegfilteren. */
+    /*
+     * In praktijk geeft een "blind" 24-bit read vaak vals-positieven.
+     * SDR# lijkt (impliciet) alleen plausibele 24-bit groeps-ID's te accepteren.
+     * Heuristiek (zelfde range als de oude debug-candidate-scan):
+     *  - 0xFFFFFF is "open" SSI in ETSI context (niet wegfilteren)
+     *  - anders: 1.000.000 .. 9.000.000
+     */
     if (!list || !count || gssi == 0)
+        return;
+
+    if (!(gssi == 0xFFFFFFu || (gssi >= 1000000u && gssi <= 9000000u)))
         return;
 
     for (uint8_t i = 0; i < *count; i++) {
@@ -248,12 +257,19 @@ static void mm_parse_group_identity_location_accept(const uint8_t *bits, unsigne
             }
 
             if (gssi != 0) {
+                /* add_gssi_to_list() filtert nu ook op plausibiliteit */
+                uint8_t before = out_gssi_count ? *out_gssi_count : 0;
                 add_gssi_to_list(gssi, out_gssi_list, out_gssi_count, out_gssi_max);
-                if (out_gssi && out_have_gssi && idx == 0) {
-                    *out_gssi = gssi;
-                    *out_have_gssi = 1;
+                uint8_t after = out_gssi_count ? *out_gssi_count : before;
+
+                /* Alleen "eerste" GSSI zetten als hij ook echt geaccepteerd werd */
+                if (after > before) {
+                    if (out_gssi && out_have_gssi && idx == 0) {
+                        *out_gssi = gssi;
+                        *out_have_gssi = 1;
+                    }
+                    idx++;
                 }
-                idx++;
             }
         } else if (sel == 2) {
             if (p + 24u > bitlen)
@@ -308,11 +324,23 @@ static void mm_scan_type34_elements(const uint8_t *bits, unsigned int bitlen, un
         }
         /* tid 0x7: legacy single GSSI (24 bits) */
         else if (tid == 0x7 && li >= 24) {
-            uint32_t val = get_bits(bits, bitlen, content_offset, 24);
-            add_gssi_to_list(val, out_gssi_list, out_gssi_count, out_gssi_max);
-            if (out_gssi && out_have_gssi) {
-                *out_gssi = val;
-                *out_have_gssi = 1;
+            /*
+             * In echte captures zit de 24-bit GSSI niet altijd op content_offset.
+             * We scannen daarom binnen dit element naar een plausibele 24-bit waarde,
+             * en nemen de eerste die door add_gssi_to_list() geaccepteerd wordt.
+             */
+            for (unsigned int off = 0; off + 24u <= li; off++) {
+                uint32_t val = get_bits(bits, bitlen, content_offset + off, 24);
+                uint8_t before = out_gssi_count ? *out_gssi_count : 0;
+                add_gssi_to_list(val, out_gssi_list, out_gssi_count, out_gssi_max);
+                uint8_t after = out_gssi_count ? *out_gssi_count : before;
+                if (after > before) {
+                    if (out_gssi && out_have_gssi) {
+                        *out_gssi = val;
+                        *out_have_gssi = 1;
+                    }
+                    break;
+                }
             }
         }
         /* tid 0x6: CCK identifier (vaak laatste 8 bits van element) */
