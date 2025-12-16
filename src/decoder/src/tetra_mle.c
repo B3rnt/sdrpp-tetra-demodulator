@@ -8,213 +8,259 @@
 #include "tetra_mm_pdu.h"
 #include "crypto/tetra_crypto.h"
 
-/* ---------- ROBUUSTE HELPERS ---------- */
+/*
+ * Robuuste MM decoder voor LLC-bypass.
+ *
+ * Wat er mis ging in de eerdere versie:
+ *  - De code nam aan dat na PDISC(3) meteen de PDU-type(4) komt.
+ *    In praktijk zit er vaak een 1-bit "spare/skip" tussen (PDISC=3, spare=1, type=4).
+ *    Daardoor las je altijd het verkeerde type en zag je nooit D-LOC-UPD-ACC.
+ *  - De header van D-LOC-UPD-ACC is variabel (meerdere type-2 velden optioneel).
+ *    In plaats van exact alle C/O-velden te rekenen (wat afhankelijk is van LU-type etc.),
+ *    is het betrouwbaarder om de Type-3/4 elementen te zoeken via hun eigen TLV header.
+ *
+ * Resultaat:
+ *  - Detecteer MM PDISC met 3 bits.
+ *  - Probeer 2 varianten voor PDU-type offset: +3 (oude) en +4 (met spare bit).
+ *  - Voor D-LOC-UPD-ACC: zoek Type-3/4 elementen anywhere na het type.
+ *
+ * Dit matcht beter wat SDR# laat zien: "MS request for registration ACCEPTED ... GSSI ... CCK_identifier ..."
+ */
 
-/* Leest N bits uit een bitstream array */
-static uint32_t get_bits(const uint8_t *bits, unsigned int len, unsigned int pos, unsigned int n) {
-    if (pos + n > len) return 0;
+/* ---------- BIT HELPERS ---------- */
+
+static uint32_t get_bits(const uint8_t *bits, unsigned int len, unsigned int pos, unsigned int n)
+{
+    if (!bits || n == 0 || pos + n > len)
+        return 0;
     uint32_t val = 0;
-    for (unsigned int i = 0; i < n; i++) {
-        val = (val << 1) | (bits[pos + i] & 1);
-    }
+    for (unsigned int i = 0; i < n; i++)
+        val = (val << 1) | (bits[pos + i] & 1u);
     return val;
 }
 
-/* Helper om GSSI uniek toe te voegen */
-static void add_gssi_to_list(uint32_t gssi, uint32_t *list, uint8_t *count, uint8_t max) {
-    /*
-     * NB: 0xFFFFFF wordt in ETSI-contexten gebruikt als "open" / wildcard SSI.
-     * Veel netten signaleren (G)SSI=0xFFFFFF, dus dit NIET wegfilteren.
-     */
-    if (!list || !count || gssi == 0) return;
-    for (uint8_t i = 0; i < *count; i++) if (list[i] == gssi) return;
-    if (*count < max) list[(*count)++] = gssi;
+static void add_gssi_to_list(uint32_t gssi, uint32_t *list, uint8_t *count, uint8_t max)
+{
+    /* 0xFFFFFF is "open" SSI in ETSI context (veel netten sturen dit). Niet wegfilteren. */
+    if (!list || !count || gssi == 0)
+        return;
+
+    for (uint8_t i = 0; i < *count; i++) {
+        if (list[i] == gssi)
+            return;
+    }
+
+    if (*count < max)
+        list[(*count)++] = gssi;
 }
 
-/* ---------- ETSI CONFORME PARSERS ---------- */
+/* ---------- Type-3/4 element parsing ---------- */
 
 /*
- * Parseer de "Group identity location accept" lijst.
- * Dit is de crux: dit is een LIJST structuur, geen standaard TLV.
+ * Parseer "Group identity location accept" (speciale lijst-structuur).
+ * Verwacht bits pointer naar begin van de lijst (dus direct NA de type-3 header),
+ * en bitlen = LI van de type-3 header.
  */
 static void mm_parse_group_list(const uint8_t *bits, unsigned int bitlen,
                                 uint32_t *out_gssi_list, uint8_t *out_gssi_count, uint8_t out_gssi_max,
-                                uint32_t *out_gssi, uint8_t *out_have_gssi) 
+                                uint32_t *out_gssi, uint8_t *out_have_gssi)
 {
     unsigned int p = 0;
-    
-    /* Header van de Group Identity structuur */
-    if (p + 5 > bitlen) return;
-    p += 1; /* Accept/Reject */
-    p += 1; /* Reserved */
-    
+
+    /* Accept/Reject (1) + reserved (1) + count (3) */
+    if (p + 5 > bitlen)
+        return;
+
+    p += 1; /* accept/reject */
+    p += 1; /* reserved */
     uint8_t count = (uint8_t)get_bits(bits, bitlen, p, 3);
     p += 3;
 
     for (uint8_t i = 0; i < count; i++) {
-        /* Group element headers */
-        if (p + 3 > bitlen) break;
-        p += 2; /* Unexchangeable(1) + Visitor(1) */
-        
+        if (p + 3 > bitlen)
+            break;
+
+        p += 2; /* unexchangeable + visitor */
         uint8_t gtype = (uint8_t)get_bits(bits, bitlen, p, 1);
         p += 1;
 
         uint32_t current_gssi = 0;
-        
-        if (gtype == 0) { 
+
+        if (gtype == 0) {
             /* Normal GSSI (24 bits) */
-            if (p + 24 > bitlen) break;
+            if (p + 24 > bitlen)
+                break;
             current_gssi = get_bits(bits, bitlen, p, 24);
             p += 24;
-        } else { 
-            /* Extended (GSSI + MCC + MNC) -> Wij pakken alleen GSSI */
-            if (p + 48 > bitlen) break;
+        } else {
+            /* Extended: GSSI(24) + MCC/MNC etc (extra 24) -> total 48; we pakken alleen GSSI */
+            if (p + 48 > bitlen)
+                break;
             current_gssi = get_bits(bits, bitlen, p, 24);
             p += 48;
         }
-        
-        /* Attachment Mode (1) + Class of Usage (3) */
-        if (p + 4 > bitlen) break;
-        p += 4; 
 
-        /* Store result */
+        /* Attachment mode (1) + class of usage (3) */
+        if (p + 4 > bitlen)
+            break;
+        p += 4;
+
         if (current_gssi != 0) {
             add_gssi_to_list(current_gssi, out_gssi_list, out_gssi_count, out_gssi_max);
-            if (out_gssi && out_have_gssi) { *out_gssi = current_gssi; *out_have_gssi = 1; }
+            if (out_gssi && out_have_gssi) {
+                *out_gssi = current_gssi;
+                *out_have_gssi = 1;
+            }
         }
     }
 }
 
-/* Scanner voor Type 3/4 Elementen (de optionele staart van het bericht) */
 static void mm_scan_type34_elements(const uint8_t *bits, unsigned int bitlen, unsigned int start_bit,
-                                   uint32_t *out_gssi, uint8_t *out_have_gssi,
-                                   uint32_t *out_gssi_list, uint8_t *out_gssi_count, uint8_t out_gssi_max,
-                                   uint8_t *out_cck_id, uint8_t *out_have_cck,
-                                   uint8_t *out_roam_lu, uint8_t *out_have_roam_lu,
-                                   uint8_t *out_itsi_attach, uint8_t *out_have_itsi_attach)
+                                    uint32_t *out_gssi, uint8_t *out_have_gssi,
+                                    uint32_t *out_gssi_list, uint8_t *out_gssi_count, uint8_t out_gssi_max,
+                                    uint8_t *out_cck_id, uint8_t *out_have_cck,
+                                    uint8_t *out_roam_lu, uint8_t *out_have_roam_lu,
+                                    uint8_t *out_itsi_attach, uint8_t *out_have_itsi_attach)
 {
     unsigned int pos = start_bit;
 
     while (pos + 16u <= bitlen) {
-        /* Check M-bit */
         uint32_t mbit = get_bits(bits, bitlen, pos, 1);
-        if (mbit == 0) break; /* Geen elementen meer */
+        if (mbit == 0)
+            break; /* geen elementen meer */
 
         uint32_t tid = get_bits(bits, bitlen, pos + 1, 4);
         uint32_t li  = get_bits(bits, bitlen, pos + 5, 11);
-        
-        if (li == 0) { pos += 16; continue; }
-        
-        unsigned int elem_len = 16 + li;
-        if (pos + elem_len > bitlen) break;
 
-        /* Pointer logica simuleren door offset mee te geven */
+        if (li == 0) {
+            pos += 16;
+            continue;
+        }
+
+        unsigned int elem_len = 16 + (unsigned int)li;
+        if (pos + elem_len > bitlen)
+            break;
+
         unsigned int content_offset = pos + 16;
-        
-        if (tid == 0x5) { 
-            /* GSSI LIJST: Hier roepen we de speciale parser aan! */
-            /* We geven de pointer naar start bits mee, maar offset is content_offset */
-            /* Omdat mm_parse_group_list op index 0 begint, tellen we de offset er bij op */
-            mm_parse_group_list(bits + content_offset, li, 
-                                out_gssi_list, out_gssi_count, out_gssi_max, 
+
+        /* tid 0x5: Group identity location accept (lijst) */
+        if (tid == 0x5) {
+            mm_parse_group_list(bits + content_offset, (unsigned int)li,
+                                out_gssi_list, out_gssi_count, out_gssi_max,
                                 out_gssi, out_have_gssi);
         }
-        else if (tid == 0x7 && li >= 24) { /* Legacy Single GSSI */
-             uint32_t val = get_bits(bits, bitlen, content_offset, 24);
-             add_gssi_to_list(val, out_gssi_list, out_gssi_count, out_gssi_max);
-             if (out_gssi) { *out_gssi = val; *out_have_gssi = 1; }
-        }
-        else if (tid == 0x6 && li >= 8 && out_cck_id) { /* CCK */
-             *out_cck_id = (uint8_t)get_bits(bits, bitlen, content_offset + li - 8, 8);
-             *out_have_cck = 1;
-        }
-        else if (tid == 0x2) { /* Flags */
-            if (li >= 1 && out_roam_lu) { 
-                *out_roam_lu = (uint8_t)get_bits(bits, bitlen, content_offset + li - 1, 1); 
-                *out_have_roam_lu = 1; 
-            }
-            if (li >= 2 && out_itsi_attach) { 
-                *out_itsi_attach = (uint8_t)get_bits(bits, bitlen, content_offset + li - 2, 1); 
-                *out_have_itsi_attach = 1; 
+        /* tid 0x7: legacy single GSSI (24 bits) */
+        else if (tid == 0x7 && li >= 24) {
+            uint32_t val = get_bits(bits, bitlen, content_offset, 24);
+            add_gssi_to_list(val, out_gssi_list, out_gssi_count, out_gssi_max);
+            if (out_gssi && out_have_gssi) {
+                *out_gssi = val;
+                *out_have_gssi = 1;
             }
         }
+        /* tid 0x6: CCK identifier (vaak laatste 8 bits van element) */
+        else if (tid == 0x6 && li >= 8 && out_cck_id && out_have_cck) {
+            *out_cck_id = (uint8_t)get_bits(bits, bitlen, content_offset + (unsigned int)li - 8, 8);
+            *out_have_cck = 1;
+        }
+        /* tid 0x2: flags (roaming / itsi attach etc; netwerk-specifiek, maar vaak LSB’s) */
+        else if (tid == 0x2) {
+            if (li >= 1 && out_roam_lu && out_have_roam_lu) {
+                *out_roam_lu = (uint8_t)get_bits(bits, bitlen, content_offset + (unsigned int)li - 1, 1);
+                *out_have_roam_lu = 1;
+            }
+            if (li >= 2 && out_itsi_attach && out_have_itsi_attach) {
+                *out_itsi_attach = (uint8_t)get_bits(bits, bitlen, content_offset + (unsigned int)li - 2, 1);
+                *out_have_itsi_attach = 1;
+            }
+        }
+
         pos += elem_len;
     }
 }
 
-/* Verwerkt de inhoud van D-LOCATION UPDATE ACCEPT */
-static void handle_loc_upd_acc(uint32_t issi, uint16_t la, const uint8_t *mm_bits, unsigned int len, unsigned int offset)
+/*
+ * Zoek in de bitstream naar een plausibele Type-3/4 element header:
+ *   M(1)=1, TID(4), LI(11) met LI > 0 en pos+16+LI <= nbits.
+ * En liefst TID in een set die we echt gebruiken (0x5 GSSI list, 0x6 CCK, 0x2 flags, 0x7 single GSSI).
+ */
+static int find_first_type34(const uint8_t *bits, unsigned int nbits, unsigned int start)
 {
-    unsigned int pos = offset; // Start na PDU Type
-    
-    /* Header velden (Tabel 16.10.2) */
-    if (pos + 8 > len) return;
-    
-    // uint8_t loc_type = get_bits(mm_bits, len, pos, 3);
-    pos += 3;
-    
-    uint8_t ssi_pres = (uint8_t)get_bits(mm_bits, len, pos, 1);
-    pos += 1;
+    if (!bits || nbits < 16 || start >= nbits)
+        return -1;
 
-    /* CRUCIAAL: Als SSI aanwezig is, moeten we 24 bits opschuiven! */
-    if (ssi_pres) {
-        if (pos + 24 > len) return;
-        pos += 24; 
+    for (unsigned int pos = start; pos + 16u <= nbits; pos++) {
+        uint32_t mbit = get_bits(bits, nbits, pos, 1);
+        if (mbit != 1)
+            continue;
+
+        uint32_t tid = get_bits(bits, nbits, pos + 1, 4);
+        if (!(tid == 0x5 || tid == 0x6 || tid == 0x2 || tid == 0x7))
+            continue;
+
+        uint32_t li = get_bits(bits, nbits, pos + 5, 11);
+        if (li == 0)
+            continue;
+
+        /* sanity: li niet absurd groot */
+        if (li > 512)
+            continue;
+
+        if (pos + 16u + (unsigned int)li <= nbits)
+            return (int)pos;
     }
 
-    /* Validity (2) + Reserved (1) */
-    if (pos + 3 > len) return;
-    pos += 3;
+    return -1;
+}
 
-    /* O-bit (Optional elements) */
-    if (pos + 1 > len) return;
-    uint8_t o_bit = (uint8_t)get_bits(mm_bits, len, pos, 1);
-    pos += 1;
+/* ---------- Logging helpers ---------- */
 
-    if (!o_bit) {
-        mm_logf_ctx(issi, la, "D-LOC-UPD-ACC SSI:%u (No GSSI info)", (unsigned)issi);
-        return;
-    }
+static void log_loc_upd_accept_like_sdrsharp(uint32_t issi, int la,
+                                             const uint32_t *gssi_list, uint8_t gssi_count,
+                                             uint8_t have_cck, uint8_t cck_id,
+                                             uint8_t have_roam, uint8_t roam_lu)
+{
+    char gbuf[128];
+    gbuf[0] = 0;
 
-    /* Start scanning Type 3/4 elements */
-    uint32_t gssi = 0;
-    uint8_t  have_gssi = 0;
-    uint32_t gssi_list[8];
-    uint8_t  gssi_count = 0;
-    uint8_t  cck_id = 0;
-    uint8_t  have_cck = 0;
-    uint8_t  roam_lu = 0;
-    uint8_t  have_roam_lu = 0;
-    uint8_t  itsi_attach = 0;
-    uint8_t  have_itsi_attach = 0;
-    memset(gssi_list, 0, sizeof(gssi_list));
-
-    mm_scan_type34_elements(mm_bits, len, pos,
-                            &gssi, &have_gssi, gssi_list, &gssi_count, 8,
-                            &cck_id, &have_cck, &roam_lu, &have_roam_lu,
-                            &itsi_attach, &have_itsi_attach);
-
-    /* Formatteer output */
-    char tail[256]; tail[0] = 0;
-    if (have_cck) { char tmp[64]; snprintf(tmp, sizeof(tmp), " - CCK:%u", cck_id); strncat(tail, tmp, 200); }
-    if (have_roam_lu && roam_lu) strncat(tail, " - Roaming", 200);
-    if (have_itsi_attach && itsi_attach) strncat(tail, " - Attach", 200);
-
-    char gbuf[128]; gbuf[0] = 0;
-    if (gssi_count > 0) {
-        size_t o2 = 0;
-        for (uint8_t i=0; i<gssi_count; i++) {
+    if (gssi_list && gssi_count > 0) {
+        size_t o = 0;
+        for (uint8_t i = 0; i < gssi_count; i++) {
             char tmp[32];
             if (gssi_list[i] == 0xFFFFFFu)
-                snprintf(tmp, sizeof(tmp), "%sOPEN(0xFFFFFF)", (i?",":""));
+                snprintf(tmp, sizeof(tmp), "%sOPEN(0xFFFFFF)", (i ? ", " : ""));
             else
-                snprintf(tmp, sizeof(tmp), "%s%u", (i?",":""), gssi_list[i]);
+                snprintf(tmp, sizeof(tmp), "%s%u", (i ? ", " : ""), (unsigned)gssi_list[i]);
+
             size_t tl = strlen(tmp);
-            if(o2+tl+1 < sizeof(gbuf)) { memcpy(gbuf+o2, tmp, tl); o2+=tl; gbuf[o2]=0; }
+            if (o + tl + 1 < sizeof(gbuf)) {
+                memcpy(gbuf + o, tmp, tl);
+                o += tl;
+                gbuf[o] = 0;
+            }
         }
-        mm_logf_ctx(issi, la, "D-LOC-UPD-ACC SSI:%u GSSI(s):%s%s", (unsigned)issi, gbuf, tail);
+    }
+
+    char tail[256];
+    tail[0] = 0;
+
+    if (have_cck) {
+        char tmp[64];
+        snprintf(tmp, sizeof(tmp), " - CCK_identifier: %u", (unsigned)cck_id);
+        strncat(tail, tmp, sizeof(tail) - strlen(tail) - 1);
+    }
+    if (have_roam && roam_lu) {
+        strncat(tail, " - Roaming location updating", sizeof(tail) - strlen(tail) - 1);
+    }
+
+    if (gssi_count > 0) {
+        mm_logf_ctx(issi, (uint16_t)la,
+                    "MS request for registration ACCEPTED for SSI: %u GSSI: %s%s",
+                    (unsigned)issi, gbuf, tail);
     } else {
-        mm_logf_ctx(issi, la, "D-LOC-UPD-ACC SSI:%u%s", (unsigned)issi, tail);
+        mm_logf_ctx(issi, (uint16_t)la,
+                    "MS request for registration ACCEPTED for SSI: %u%s",
+                    (unsigned)issi, tail);
     }
 }
 
@@ -223,79 +269,116 @@ static void handle_loc_upd_acc(uint32_t issi, uint16_t la, const uint8_t *mm_bit
 int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
 {
     const uint8_t *buf = msg ? (const uint8_t *)msg->l3h : NULL;
-    if (!buf || len < 1) return (int)len;
+    if (!buf || len < 1)
+        return (int)len;
 
     uint32_t issi = tms ? (uint32_t)tms->ssi : 0;
-    int la = (tms && tms->tcs) ? tms->tcs->la : -1;
+    int la = (tms && tms->tcs) ? (int)tms->tcs->la : -1;
 
-    /* * STAP 1: Detecteer data formaat (Packed vs Unpacked)
-     * Als er bytes > 1 zijn, is het zeker Packed.
-     */
+    /* Detecteer packed vs unpacked */
     int is_packed = 0;
-    for(unsigned int i=0; i<len; i++) {
-        if(buf[i] > 1) { is_packed = 1; break; }
+    for (unsigned int i = 0; i < len; i++) {
+        if (buf[i] > 1) { is_packed = 1; break; }
     }
 
-    /* * STAP 2: Maak een schone bitstream array
-     */
+    /* Maak bitstream */
     static uint8_t bits[4096];
     unsigned int nbits = 0;
 
     if (is_packed) {
-        /* Packed: 1 byte = 8 bits. Uitpakken. */
-        if (len * 8 > 4096) len = 512;
+        /* Packed: bytes -> bits (MSB first) */
+        if (len * 8 > sizeof(bits))
+            len = (unsigned int)(sizeof(bits) / 8);
+
         for (unsigned int i = 0; i < len; i++) {
             uint8_t b = buf[i];
-            for (int k = 7; k >= 0; k--) bits[nbits++] = (b >> k) & 1u;
+            for (int k = 7; k >= 0; k--)
+                bits[nbits++] = (b >> k) & 1u;
         }
     } else {
-        /* Unpacked: 1 byte = 1 bit. Direct kopiëren. */
-        if (len > 4096) len = 4096;
-        for (unsigned int i = 0; i < len; i++) bits[nbits++] = buf[i] & 1u;
+        /* Unpacked: 1 byte = 1 bit */
+        if (len > sizeof(bits))
+            len = (unsigned int)sizeof(bits);
+        for (unsigned int i = 0; i < len; i++)
+            bits[nbits++] = buf[i] & 1u;
     }
 
-    /* * STAP 3: SCANNER - Vind de juiste offset
-     * We zoeken naar PDISC=1 (MM). De bit-alignment kan variëren.
-     */
-    int found = 0;
-    
-    /*
-     * We proberen ALLE offsets (niet alleen 0..7).
-     * Bij LLC-bypass / variërende headers kan de PDISC alignment veel verder opschuiven.
-     */
-    for (unsigned int off = 0; off + 7u <= nbits; off++) {
-        /* Hebben minstens PDISC(3)+TYPE(4) nodig */
-        if (nbits < off + 7u) break;
+    if (nbits < 8)
+        return (int)len;
 
-        /* Check PDISC (3 bits) */
+    /* Zoek MM PDUs: PDISC is 3 bits, maar type-offset kan +3 of +4 zijn */
+    for (unsigned int off = 0; off + 12u <= nbits; off++) {
         uint8_t pdisc = (uint8_t)get_bits(bits, nbits, off, 3);
-        
-        /* We zoeken specifiek MM protocol (1) */
-        if (pdisc != TMLE_PDISC_MM) continue;
+        if (pdisc != TMLE_PDISC_MM)
+            continue;
 
-        /* PDISC klopt, check nu Type (4 bits) */
-        uint8_t type = (uint8_t)get_bits(bits, nbits, off + 3, 4);
+        /* Probeer beide layouts */
+        unsigned int type_offsets[2] = { off + 3, off + 4 };
 
-        /* Is het een bekend type? */
-        if (type == 0x5) { /* D-LOCATION UPDATE ACCEPT */
-            // mm_logf_ctx(issi, la, "[DEBUG] MM Detect: Type 5 at offset %u", off);
-            handle_loc_upd_acc(issi, la, bits, nbits, off + 3 + 4);
-            found = 1;
-            break; /* Gevonden! */
-        }
-        else if (type == 0x1) { /* D-AUTH */
-             /* Check subtype om zeker te zijn */
-             if (nbits >= off + 7 + 2) {
-                 uint8_t st = (uint8_t)get_bits(bits, nbits, off + 7, 2);
-                 if (st == 0) mm_logf_ctx(issi, la, "BS demands authentication: SSI: %u", (unsigned)issi);
-                 else if (st == 2) mm_logf_ctx(issi, la, "BS result to MS auth: Result SSI: %u", (unsigned)issi);
-                 // else mm_logf_ctx(issi, la, "D-AUTH subtype %u", st);
-                 found = 1;
-                 break;
-             }
+        for (unsigned int vi = 0; vi < 2; vi++) {
+            unsigned int toff = type_offsets[vi];
+            if (toff + 4 > nbits)
+                continue;
+
+            uint8_t type = (uint8_t)get_bits(bits, nbits, toff, 4);
+
+            /* D-AUTH: subtype zit direct daarna; die logging had je al werkend */
+            if (type == TMM_PDU_T_D_AUTH) {
+                if (toff + 4 + 2 <= nbits) {
+                    uint8_t st = (uint8_t)get_bits(bits, nbits, toff + 4, 2);
+                    if (st == 0)
+                        mm_logf_ctx(issi, (uint16_t)la, "BS demands authentication: SSI: %u", (unsigned)issi);
+                    else if (st == 2)
+                        mm_logf_ctx(issi, (uint16_t)la, "BS result to MS auth: Result SSI: %u", (unsigned)issi);
+                    else
+                        mm_logf_ctx(issi, (uint16_t)la, "BS auth message (subtype %u): SSI: %u", (unsigned)st, (unsigned)issi);
+                    return (int)len;
+                }
+            }
+
+            /* D-LOCATION UPDATE ACCEPT: hier zit de GSSI/CCK/flags in type-3/4 elementen */
+            if (type == TMM_PDU_T_D_LOC_UPD_ACC) {
+                /* We weten niet exact waar de variabele header eindigt, dus:
+                 * zoek de eerste Type-3/4 TLV header ergens na 'type' */
+                unsigned int scan_start = toff + 4; /* na PDU-type */
+                int t34 = find_first_type34(bits, nbits, scan_start);
+
+                uint32_t gssi_list[8];
+                uint8_t gssi_count = 0;
+                memset(gssi_list, 0, sizeof(gssi_list));
+
+                uint32_t gssi = 0;
+                uint8_t have_gssi = 0;
+                uint8_t cck_id = 0;
+                uint8_t have_cck = 0;
+                uint8_t roam = 0;
+                uint8_t have_roam = 0;
+                uint8_t itsi_attach = 0;
+                uint8_t have_itsi_attach = 0;
+
+                if (t34 >= 0) {
+                    mm_scan_type34_elements(bits, nbits, (unsigned int)t34,
+                                            &gssi, &have_gssi,
+                                            gssi_list, &gssi_count, 8,
+                                            &cck_id, &have_cck,
+                                            &roam, &have_roam,
+                                            &itsi_attach, &have_itsi_attach);
+
+                    /* Log in SDR# stijl */
+                    log_loc_upd_accept_like_sdrsharp(issi, la, gssi_list, gssi_count,
+                                                     have_cck, cck_id,
+                                                     have_roam, roam);
+                } else {
+                    /* Geen type3/4 gevonden -> toch melden dat accept is gezien */
+                    mm_logf_ctx(issi, (uint16_t)la, "MS request for registration ACCEPTED for SSI: %u", (unsigned)issi);
+                }
+
+                return (int)len;
+            }
+
+            /* Andere MM types kun je later toevoegen (LOC_UPD_PROC, LOC_UPD_REJ, ...). */
         }
     }
 
-    /* Als we niks specifieks vonden, doet de oude logica (buiten deze functie) de rest */
     return (int)len;
 }
