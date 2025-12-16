@@ -455,7 +455,17 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
     if (nbits < 8)
         return (int)len;
 
-    /* Zoek MM PDUs: PDISC is 3 bits, maar type-offset kan +3 of +4 zijn */
+    /*
+     * Oude aanpak ("scan en pak de eerste match") gaf false positives: we konden een random
+     * bitpatroon als MM-type herkennen, meteen loggen en returnen, waardoor de échte MM PDU
+     * (met GSSI/roaming/etc) gemist werd.
+     *
+     * Daarom scoren we nu alle candidates en kiezen de beste match.
+     */
+    unsigned int best_off = 0, best_toff = 0;
+    uint8_t best_type = 0;
+    int best_score = 0;
+
     for (unsigned int off = 0; off + 12u <= nbits; off++) {
         uint8_t pdisc = (uint8_t)get_bits(bits, nbits, off, 3);
         if (pdisc != TMLE_PDISC_MM)
@@ -463,109 +473,32 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
 
 #if MM_DEBUG_BITS
         if (!mm_debug_done) {
-            /* Dump only once per TL-SDU to avoid log spam */
             mm_debug_dump_mm_ctx(issi, (uint16_t)la, bits, nbits, off);
             mm_debug_done = 1;
         }
 #endif
 
-        /* Probeer beide layouts */
         unsigned int type_offsets[4] = { off + 4, off + 3, off + 5, off + 6 };
-
         for (unsigned int vi = 0; vi < 4; vi++) {
             unsigned int toff = type_offsets[vi];
             if (toff + 4 > nbits)
                 continue;
 
             uint8_t type = (uint8_t)get_bits(bits, nbits, toff, 4);
+            int score = 0;
 
-            /* Debug: show candidate MM type offsets (helps alignment issues) */
-            /* mm_logf_ctx(issi, (uint16_t)la, "MM candidate: off=%u toff=%u type=0x%X", off, toff, (unsigned)type); */
-
-            /* D-AUTH: subtype zit direct daarna; die logging had je al werkend */
             if (type == TMM_PDU_T_D_AUTH) {
-                if (toff + 4 + 2 <= nbits) {
+                if (toff + 6 <= nbits) {
                     uint8_t st = (uint8_t)get_bits(bits, nbits, toff + 4, 2);
-                    if (st == 0)
-                        mm_logf_ctx(issi, (uint16_t)la, "BS demands authentication: SSI: %u", (unsigned)issi);
-                    else if (st == 2)
-                        mm_logf_ctx(issi, (uint16_t)la,
-                                    "BS result to MS authentication: Authentication successful or no authentication currently in progress SSI: %u - Authentication successful or no authentication currently in progress",
-                                    (unsigned)issi);
-                    else
-                        mm_logf_ctx(issi, (uint16_t)la, "BS auth message (subtype %u): SSI: %u", (unsigned)st, (unsigned)issi);
-                    return (int)len;
+                    score = (st == 0 || st == 2) ? 95 : 70;
                 }
-            }
-
-            if (type == TMM_PDU_T_D_LOC_UPD_CMD) {
+            } else if (type == TMM_PDU_T_D_LOC_UPD_ACC) {
+                /* Validate by checking we can find at least one sane Type-3/4 element after rules_0 */
                 unsigned int payload_start = toff + 4;
-                mm_field_store fs = {0};
-                (void)mm_rules_decode(bits, nbits, payload_start,
-                                      mm_rules_loc_upd_command, mm_rules_loc_upd_command_count,
-                                      &fs);
-                mm_logf_ctx(issi, (uint16_t)la, "SwMI sent LOCATION UPDATE COMMAND for SSI: %u", (unsigned)issi);
-                return (int)len;
-            }
-
-            if (type == TMM_PDU_T_D_ATT_DET_GRP) {
-                unsigned int payload_start = toff + 4;
-                mm_field_store fs = {0};
-                (void)mm_rules_decode(bits, nbits, payload_start,
-                                      mm_rules_att_det_grp, mm_rules_att_det_grp_count,
-                                      &fs);
-                mm_logf_ctx(issi, (uint16_t)la, "SwMI sent ATTACH/DETACH GROUP IDENTITY for SSI: %u", (unsigned)issi);
-                return (int)len;
-            }
-
-            if (type == TMM_PDU_T_D_ATT_DET_GRP_ACK) {
-                unsigned int payload_start = toff + 4;
-                mm_field_store fs = {0};
-                (void)mm_rules_decode(bits, nbits, payload_start,
-                                      mm_rules_att_det_grp_ack, mm_rules_att_det_grp_ack_count,
-                                      &fs);
-                mm_logf_ctx(issi, (uint16_t)la, "SwMI sent ATTACH/DETACH GROUP IDENTITY ACK for SSI: %u", (unsigned)issi);
-                return (int)len;
-            }
-
-            /* ===== SDR#-style MM decode (rules engine) ===== */
-
-            if (type == TMM_PDU_T_D_LOC_UPD_PROC) {
-                unsigned int payload_start = toff + 4;
-                mm_field_store fs = {0};
-                (void)mm_rules_decode(bits, nbits, payload_start,
-                                      mm_rules_loc_upd_proceeding, mm_rules_loc_upd_proceeding_count,
-                                      &fs);
-                mm_logf_ctx(issi, (uint16_t)la, "SwMI sent LOCATION UPDATE PROCEEDING for SSI: %u", (unsigned)issi);
-                return (int)len;
-            }
-
-            if (type == TMM_PDU_T_D_LOC_UPD_REJ) {
-                unsigned int payload_start = toff + 4;
-                mm_field_store fs = {0};
-                (void)mm_rules_decode(bits, nbits, payload_start,
-                                      mm_rules_loc_upd_reject, mm_rules_loc_upd_reject_count,
-                                      &fs);
-                /* reject cause is now in fs.value[GN_Reject_cause] if you want to map to text later */
-                mm_logf_ctx(issi, (uint16_t)la, "SwMI sent LOCATION UPDATE REJECT for SSI: %u (cause=%u)",
-                            (unsigned)issi,
-                            (unsigned)(fs.present[GN_Reject_cause] ? fs.value[GN_Reject_cause] : 0));
-                return (int)len;
-            }
-
-            /* D-LOCATION UPDATE ACCEPT: decode header exactly like SDR# (rules_0),
-               then parse the following Type-3/4 elements for GSSI/CCK/flags (also SDR# style). */
-            if (type == TMM_PDU_T_D_LOC_UPD_ACC) {
-                unsigned int payload_start = toff + 4; /* directly after PDU-type */
-                mm_field_store fs = {0};
-
-                /* Run SDR# rules_0 to get the exact end of the variable header */
+                mm_field_store tmp = {0};
                 unsigned int after_hdr = mm_rules_decode(bits, nbits, payload_start,
                                                         mm_rules_loc_upd_accept, mm_rules_loc_upd_accept_count,
-                                                        &fs);
-
-                /* SDR#-like: Type-3/4 elements start EXACTLY after rules_0 header.
-                   If it doesn't look like a valid Type-3/4 header, fall back to scanning forward. */
+                                                        &tmp);
                 int t34 = -1;
                 if (after_hdr + 16u <= nbits) {
                     uint32_t mbit = get_bits(bits, nbits, after_hdr, 1);
@@ -577,83 +510,190 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
                         t34 = (int)after_hdr;
                     }
                 }
-                if (t34 < 0) {
+                if (t34 < 0)
                     t34 = find_first_type34(bits, nbits, after_hdr);
-                }
-
-                uint32_t gssi_list[8];
-                uint8_t gssi_count = 0;
-                memset(gssi_list, 0, sizeof(gssi_list));
-
-                uint8_t cck_id = 0;
-                uint8_t have_cck = 0;
-                uint8_t roam = 0;
-                uint8_t have_roam = 0;
-                uint8_t itsi_attach = 0;
-                uint8_t have_itsi_attach = 0;
-                uint32_t gssi = 0;
-                uint8_t have_gssi = 0;
-
-                if (t34 >= 0) {
-                    mm_scan_type34_elements(bits, nbits, (unsigned int)t34,
-                                            &gssi, &have_gssi,
-                                            gssi_list, &gssi_count, 8,
-                                            &cck_id, &have_cck,
-                                            &roam, &have_roam,
-                                            &itsi_attach, &have_itsi_attach);
-                }
-
-                /* Prefer SSI from header if present (SDR# MM_SSI field) */
-                uint32_t ssi_out = issi;
-                if (fs.present[GN_MM_SSI]) ssi_out = fs.value[GN_MM_SSI];
-
-                /* Log in SDR# style */
-                if (gssi_count > 0) {
-                    char gbuf[128]; gbuf[0] = 0;
-                    size_t o = 0;
-                    for (uint8_t i = 0; i < gssi_count; i++) {
-                        char tmp[32];
-                        snprintf(tmp, sizeof(tmp), "%s%u", (i ? ", " : ""), (unsigned)gssi_list[i]);
-                        size_t tl = strlen(tmp);
-                        if (o + tl + 1 < sizeof(gbuf)) { memcpy(gbuf + o, tmp, tl); o += tl; gbuf[o] = 0; }
-                    }
-                    if (have_cck) {
-                        if (have_roam && roam) {
-                            mm_logf_ctx(issi, (uint16_t)la,
-                                        "MS request for registration/authentication ACCEPTED for SSI: %u GSSI: %s - CCK_identifier: %u - Roaming location updating",
-                                        (unsigned)ssi_out, gbuf, (unsigned)cck_id);
-                        } else {
-                            mm_logf_ctx(issi, (uint16_t)la,
-                                        "MS request for registration/authentication ACCEPTED for SSI: %u GSSI: %s - CCK_identifier: %u",
-                                        (unsigned)ssi_out, gbuf, (unsigned)cck_id);
-                        }
-                    } else {
-                        mm_logf_ctx(issi, (uint16_t)la,
-                                    "MS request for registration/authentication ACCEPTED for SSI: %u GSSI: %s",
-                                    (unsigned)ssi_out, gbuf);
-                    }
-                } else {
-                    if (have_cck) {
-                        if (have_roam && roam) {
-                            mm_logf_ctx(issi, (uint16_t)la,
-                                        "MS request for registration/authentication ACCEPTED for SSI: %u - CCK_identifier: %u - Roaming location updating",
-                                        (unsigned)ssi_out, (unsigned)cck_id);
-                        } else {
-                            mm_logf_ctx(issi, (uint16_t)la,
-                                        "MS request for registration/authentication ACCEPTED for SSI: %u - CCK_identifier: %u",
-                                        (unsigned)ssi_out, (unsigned)cck_id);
-                        }
-                    } else {
-                        mm_logf_ctx(issi, (uint16_t)la,
-                                    "MS request for registration/authentication ACCEPTED for SSI: %u",
-                                    (unsigned)ssi_out);
-                    }
-                }
-
-                return (int)len;
+                score = (t34 >= 0) ? 100 : 80;
+            } else if (type == TMM_PDU_T_D_LOC_UPD_REJ) {
+                score = 60;
+            } else if (type == TMM_PDU_T_D_LOC_UPD_PROC) {
+                score = 55;
+            } else if (type == TMM_PDU_T_D_LOC_UPD_CMD) {
+                score = 55;
+            } else if (type == TMM_PDU_T_D_ATT_DET_GRP || type == TMM_PDU_T_D_ATT_DET_GRP_ACK) {
+                score = 50;
             }
 
-            /* Andere MM types kun je later toevoegen (LOC_UPD_PROC, LOC_UPD_REJ, ...). */
+            if (score > best_score || (score == best_score && score > 0 && toff < best_toff)) {
+                best_score = score;
+                best_off = off;
+                best_toff = toff;
+                best_type = type;
+            }
+        }
+    }
+
+    (void)best_off; /* reserved for future heuristics / diagnostics */
+
+    if (best_score > 0) {
+        unsigned int toff = best_toff;
+        uint8_t type = best_type;
+
+        if (type == TMM_PDU_T_D_AUTH) {
+            if (toff + 6 <= nbits) {
+                uint8_t st = (uint8_t)get_bits(bits, nbits, toff + 4, 2);
+                if (st == 0)
+                    mm_logf_ctx(issi, (uint16_t)la, "BS demands authentication: SSI: %u", (unsigned)issi);
+                else if (st == 2)
+                    mm_logf_ctx(issi, (uint16_t)la,
+                                "BS result to MS authentication: Authentication successful or no authentication currently in progress SSI: %u - Authentication successful or no authentication currently in progress",
+                                (unsigned)issi);
+                else
+                    mm_logf_ctx(issi, (uint16_t)la, "BS auth message (subtype %u): SSI: %u", (unsigned)st, (unsigned)issi);
+                return (int)len;
+            }
+        }
+
+        if (type == TMM_PDU_T_D_LOC_UPD_CMD) {
+            unsigned int payload_start = toff + 4;
+            mm_field_store fs = {0};
+            (void)mm_rules_decode(bits, nbits, payload_start,
+                                  mm_rules_loc_upd_command, mm_rules_loc_upd_command_count,
+                                  &fs);
+            mm_logf_ctx(issi, (uint16_t)la, "SwMI sent LOCATION UPDATE COMMAND for SSI: %u", (unsigned)issi);
+            return (int)len;
+        }
+
+        if (type == TMM_PDU_T_D_ATT_DET_GRP) {
+            unsigned int payload_start = toff + 4;
+            mm_field_store fs = {0};
+            (void)mm_rules_decode(bits, nbits, payload_start,
+                                  mm_rules_att_det_grp, mm_rules_att_det_grp_count,
+                                  &fs);
+            mm_logf_ctx(issi, (uint16_t)la, "SwMI sent ATTACH/DETACH GROUP IDENTITY for SSI: %u", (unsigned)issi);
+            return (int)len;
+        }
+
+        if (type == TMM_PDU_T_D_ATT_DET_GRP_ACK) {
+            unsigned int payload_start = toff + 4;
+            mm_field_store fs = {0};
+            (void)mm_rules_decode(bits, nbits, payload_start,
+                                  mm_rules_att_det_grp_ack, mm_rules_att_det_grp_ack_count,
+                                  &fs);
+            mm_logf_ctx(issi, (uint16_t)la, "SwMI sent ATTACH/DETACH GROUP IDENTITY ACK for SSI: %u", (unsigned)issi);
+            return (int)len;
+        }
+
+        if (type == TMM_PDU_T_D_LOC_UPD_PROC) {
+            unsigned int payload_start = toff + 4;
+            mm_field_store fs = {0};
+            (void)mm_rules_decode(bits, nbits, payload_start,
+                                  mm_rules_loc_upd_proceeding, mm_rules_loc_upd_proceeding_count,
+                                  &fs);
+            mm_logf_ctx(issi, (uint16_t)la, "SwMI sent LOCATION UPDATE PROCEEDING for SSI: %u", (unsigned)issi);
+            return (int)len;
+        }
+
+        if (type == TMM_PDU_T_D_LOC_UPD_REJ) {
+            unsigned int payload_start = toff + 4;
+            mm_field_store fs = {0};
+            (void)mm_rules_decode(bits, nbits, payload_start,
+                                  mm_rules_loc_upd_reject, mm_rules_loc_upd_reject_count,
+                                  &fs);
+            mm_logf_ctx(issi, (uint16_t)la, "SwMI sent LOCATION UPDATE REJECT for SSI: %u (cause=%u)",
+                        (unsigned)issi,
+                        (unsigned)(fs.present[GN_Reject_cause] ? fs.value[GN_Reject_cause] : 0));
+            return (int)len;
+        }
+
+        if (type == TMM_PDU_T_D_LOC_UPD_ACC) {
+            unsigned int payload_start = toff + 4; /* directly after PDU-type */
+            mm_field_store fs = {0};
+
+            unsigned int after_hdr = mm_rules_decode(bits, nbits, payload_start,
+                                                    mm_rules_loc_upd_accept, mm_rules_loc_upd_accept_count,
+                                                    &fs);
+
+            int t34 = -1;
+            if (after_hdr + 16u <= nbits) {
+                uint32_t mbit = get_bits(bits, nbits, after_hdr, 1);
+                uint32_t tid  = get_bits(bits, nbits, after_hdr + 1, 4);
+                uint32_t li   = get_bits(bits, nbits, after_hdr + 5, 11);
+                if (mbit == 1 && li > 0 && li <= 512 &&
+                    (tid == 0x5 || tid == 0x6 || tid == 0x2 || tid == 0x7) &&
+                    after_hdr + 16u + (unsigned int)li <= nbits) {
+                    t34 = (int)after_hdr;
+                }
+            }
+            if (t34 < 0)
+                t34 = find_first_type34(bits, nbits, after_hdr);
+
+            uint32_t gssi_list[8];
+            uint8_t gssi_count = 0;
+            memset(gssi_list, 0, sizeof(gssi_list));
+
+            uint8_t cck_id = 0;
+            uint8_t have_cck = 0;
+            uint8_t roam = 0;
+            uint8_t have_roam = 0;
+            uint8_t itsi_attach = 0;
+            uint8_t have_itsi_attach = 0;
+            uint32_t gssi = 0;
+            uint8_t have_gssi = 0;
+
+            if (t34 >= 0) {
+                mm_scan_type34_elements(bits, nbits, (unsigned int)t34,
+                                        &gssi, &have_gssi,
+                                        gssi_list, &gssi_count, 8,
+                                        &cck_id, &have_cck,
+                                        &roam, &have_roam,
+                                        &itsi_attach, &have_itsi_attach);
+            }
+
+            uint32_t ssi_out = issi;
+            if (fs.present[GN_MM_SSI]) ssi_out = fs.value[GN_MM_SSI];
+
+            if (gssi_count > 0) {
+                char gbuf[128]; gbuf[0] = 0;
+                size_t o = 0;
+                for (uint8_t i = 0; i < gssi_count; i++) {
+                    char tmp[32];
+                    snprintf(tmp, sizeof(tmp), "%s%u", (i ? ", " : ""), (unsigned)gssi_list[i]);
+                    size_t tl = strlen(tmp);
+                    if (o + tl + 1 < sizeof(gbuf)) { memcpy(gbuf + o, tmp, tl); o += tl; gbuf[o] = 0; }
+                }
+                if (have_cck) {
+                    if (have_roam && roam) {
+                        mm_logf_ctx(issi, (uint16_t)la,
+                                    "MS request for registration/authentication ACCEPTED for SSI: %u GSSI: %s - CCK_identifier: %u - Roaming location updating",
+                                    (unsigned)ssi_out, gbuf, (unsigned)cck_id);
+                    } else {
+                        mm_logf_ctx(issi, (uint16_t)la,
+                                    "MS request for registration/authentication ACCEPTED for SSI: %u GSSI: %s - CCK_identifier: %u",
+                                    (unsigned)ssi_out, gbuf, (unsigned)cck_id);
+                    }
+                } else {
+                    mm_logf_ctx(issi, (uint16_t)la,
+                                "MS request for registration/authentication ACCEPTED for SSI: %u GSSI: %s",
+                                (unsigned)ssi_out, gbuf);
+                }
+            } else {
+                if (have_cck) {
+                    if (have_roam && roam) {
+                        mm_logf_ctx(issi, (uint16_t)la,
+                                    "MS request for registration/authentication ACCEPTED for SSI: %u - CCK_identifier: %u - Roaming location updating",
+                                    (unsigned)ssi_out, (unsigned)cck_id);
+                    } else {
+                        mm_logf_ctx(issi, (uint16_t)la,
+                                    "MS request for registration/authentication ACCEPTED for SSI: %u - CCK_identifier: %u",
+                                    (unsigned)ssi_out, (unsigned)cck_id);
+                    }
+                } else {
+                    mm_logf_ctx(issi, (uint16_t)la,
+                                "MS request for registration/authentication ACCEPTED for SSI: %u",
+                                (unsigned)ssi_out);
+                }
+            }
+            return (int)len;
         }
     }
 
