@@ -205,59 +205,65 @@ static void add_gssi_to_list(uint32_t gssi, uint32_t *list, uint8_t *count, uint
 /* ---------- Type-3/4 element parsing ---------- */
 
 /*
- * Parseer "Group identity location accept" (speciale lijst-structuur).
- * Verwacht bits pointer naar begin van de lijst (dus direct NA de type-3 header),
- * en bitlen = LI van de type-3 header.
+ * SDR#-compatibele parser voor "Group identity location accept" (TID=0x5).
+ *
+ * De SDR# code (Class18) leest dit als een reeks records met een 2-bit selector:
+ *   sel=0: 24-bit GSSI
+ *   sel=1: 24-bit GSSI + 24-bit extra (wordt overgeslagen)
+ *   sel=2: 24-bit vGSSI
+ *   sel=3: stop/padding
+ *
+ * Dit matcht jouw debug-vondst waarbij de GSSI octet-aligned in de payload zit
+ * (bijv. ... 64 67 E8 ...).
  */
-static void mm_parse_group_list(const uint8_t *bits, unsigned int bitlen,
-                                uint32_t *out_gssi_list, uint8_t *out_gssi_count, uint8_t out_gssi_max,
-                                uint32_t *out_gssi, uint8_t *out_have_gssi)
+static void mm_parse_group_identity_location_accept(const uint8_t *bits, unsigned int bitlen,
+                                                    uint32_t *out_gssi_list, uint8_t *out_gssi_count, uint8_t out_gssi_max,
+                                                    uint32_t *out_gssi, uint8_t *out_have_gssi,
+                                                    uint32_t *out_vgssi, uint8_t *out_have_vgssi)
 {
-    unsigned int p = 0;
-
-    /* Accept/Reject (1) + reserved (1) + count (3) */
-    if (p + 5 > bitlen)
+    if (!bits || bitlen < 2)
         return;
 
-    p += 1; /* accept/reject */
-    p += 1; /* reserved */
-    uint8_t count = (uint8_t)get_bits(bits, bitlen, p, 3);
-    p += 3;
+    unsigned int p = 0;
+    uint8_t idx = 0;
 
-    for (uint8_t i = 0; i < count; i++) {
-        if (p + 3 > bitlen)
+    while (p + 2u <= bitlen) {
+        uint8_t sel = (uint8_t)get_bits(bits, bitlen, p, 2);
+        p += 2;
+
+        if (sel == 3)
             break;
 
-        p += 2; /* unexchangeable + visitor */
-        uint8_t gtype = (uint8_t)get_bits(bits, bitlen, p, 1);
-        p += 1;
-
-        uint32_t current_gssi = 0;
-
-        if (gtype == 0) {
-            /* Normal GSSI (24 bits) */
-            if (p + 24 > bitlen)
+        if (sel == 0 || sel == 1) {
+            if (p + 24u > bitlen)
                 break;
-            current_gssi = get_bits(bits, bitlen, p, 24);
+            uint32_t gssi = get_bits(bits, bitlen, p, 24);
             p += 24;
-        } else {
-            /* Extended: GSSI(24) + MCC/MNC etc (extra 24) -> total 48; we pakken alleen GSSI */
-            if (p + 48 > bitlen)
+
+            /* sel==1 heeft nog 24 bits extra; SDR# leest ze maar gebruikt ze niet voor de GSSI */
+            if (sel == 1) {
+                if (p + 24u > bitlen)
+                    break;
+                p += 24;
+            }
+
+            if (gssi != 0) {
+                add_gssi_to_list(gssi, out_gssi_list, out_gssi_count, out_gssi_max);
+                if (out_gssi && out_have_gssi && idx == 0) {
+                    *out_gssi = gssi;
+                    *out_have_gssi = 1;
+                }
+                idx++;
+            }
+        } else if (sel == 2) {
+            if (p + 24u > bitlen)
                 break;
-            current_gssi = get_bits(bits, bitlen, p, 24);
-            p += 48;
-        }
+            uint32_t vgssi = get_bits(bits, bitlen, p, 24);
+            p += 24;
 
-        /* Attachment mode (1) + class of usage (3) */
-        if (p + 4 > bitlen)
-            break;
-        p += 4;
-
-        if (current_gssi != 0) {
-            add_gssi_to_list(current_gssi, out_gssi_list, out_gssi_count, out_gssi_max);
-            if (out_gssi && out_have_gssi) {
-                *out_gssi = current_gssi;
-                *out_have_gssi = 1;
+            if (out_vgssi && out_have_vgssi) {
+                *out_vgssi = vgssi;
+                *out_have_vgssi = 1;
             }
         }
     }
@@ -291,11 +297,14 @@ static void mm_scan_type34_elements(const uint8_t *bits, unsigned int bitlen, un
 
         unsigned int content_offset = pos + 16;
 
-        /* tid 0x5: Group identity location accept (lijst) */
+        /* tid 0x5: Group identity location accept (SDR# record-structuur) */
         if (tid == 0x5) {
-            mm_parse_group_list(bits + content_offset, (unsigned int)li,
-                                out_gssi_list, out_gssi_count, out_gssi_max,
-                                out_gssi, out_have_gssi);
+            uint32_t dummy_vgssi = 0;
+            uint8_t have_dummy_vgssi = 0;
+            mm_parse_group_identity_location_accept(bits + content_offset, (unsigned int)li,
+                                                    out_gssi_list, out_gssi_count, out_gssi_max,
+                                                    out_gssi, out_have_gssi,
+                                                    &dummy_vgssi, &have_dummy_vgssi);
         }
         /* tid 0x7: legacy single GSSI (24 bits) */
         else if (tid == 0x7 && li >= 24) {
