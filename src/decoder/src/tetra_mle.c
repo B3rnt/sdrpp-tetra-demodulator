@@ -35,6 +35,7 @@ static const char *mm_auth_subtype_str(uint8_t st) {
  *   - eid 0x6 : CCK information (CCK_identifier)
  *   - eid 0xA : Authentication downlink (auth result)
  */
+
 static void mm_scan_type34_elements(const uint8_t *bits, unsigned int bitlen,
                                    unsigned int start_bit,
                                    uint32_t *out_gssi, uint8_t *out_have_gssi,
@@ -43,6 +44,11 @@ static void mm_scan_type34_elements(const uint8_t *bits, unsigned int bitlen,
                                    uint8_t *out_roam_lu, uint8_t *out_have_roam_lu,
                                    uint8_t *out_itsi_attach, uint8_t *out_have_itsi_attach)
 {
+    /* This function decodes *Type-3* MM elements as defined by the ETSI "type 3 element descriptor":
+       M-bit (1) + Type 3 MM element identifier (4) + Length Indicator (11)  => 16 bits,
+       followed by the element user data right-aligned to whole octets.
+       (See TS 100 392-5, clause describing figure "Structure of type 3 Element Identifier"). */
+
     if (out_have_gssi) *out_have_gssi = 0;
     if (out_have_cck)  *out_have_cck  = 0;
     if (out_have_auth) *out_have_auth = 0;
@@ -53,36 +59,67 @@ static void mm_scan_type34_elements(const uint8_t *bits, unsigned int bitlen,
 
     unsigned int pos = start_bit;
 
-    while (pos + 8 <= bitlen) {
-        /* IE header: 5-bit ID + 3-bit length-in-bytes (as used by SDR-TETRA summary logic) */
-        uint32_t iei  = bits_to_uint(bits + pos, 5); pos += 5;
-        uint32_t blen = bits_to_uint(bits + pos, 3); pos += 3; /* bytes */
-        unsigned int ie_bits = (unsigned int)blen * 8;
+    while (pos + 16 <= bitlen) {
+        /* Descriptor (2 octets / 16 bits) */
+        uint32_t mbit = bits_to_uint(bits + pos, 1); pos += 1;
+        uint32_t tid  = bits_to_uint(bits + pos, 4); pos += 4;   /* Type-3 MM element identifier */
+        uint32_t li   = bits_to_uint(bits + pos, 11); pos += 11; /* Length Indicator in bits */
 
-        if (pos + ie_bits > bitlen) break;
+        if (mbit == 0 || li == 0) {
+            /* Not present; per spec remaining bits are 0, but we still continue scanning
+               because some networks/devices do not strictly follow this for multiple elements. */
+            continue;
+        }
 
-        /* IDs here are "best-effort" to mimic SDR-TETRA's human log lines.
-           We only accept values when the length matches what we expect, to avoid garbage hits. */
-        if (iei == 0x01 && blen == 3 && out_gssi && out_have_gssi) {
-            *out_gssi = bits_to_uint(bits + pos, 24);
+        /* Convert LI (bits) to octet length. */
+        unsigned int elem_octets = 1u + (unsigned int)((li - 1u) / 8u);
+        unsigned int elem_bits_total = elem_octets * 8u;
+
+        if (pos + elem_bits_total > bitlen) break;
+
+        /* User data is right-aligned: skip leading unused bits in the first octet. */
+        unsigned int unused = elem_bits_total - (unsigned int)li;
+        const uint8_t *edata = bits + pos + unused;
+
+        /* Best-effort extraction of the fields SDR-TETRA shows in the summary line. */
+        if ((tid == 0x5 || tid == 0x7) && li >= 32 && out_gssi && out_have_gssi) {
+            /* Group identity location accept (0x5) may contain subelements; the "Group identity downlink"
+               subelement is 4 octets and carries the GSSI in the least significant 24 bits. The standalone
+               "Group identity downlink" Type-3 element (0x7) is also 4 octets. */
+            uint32_t v = bits_to_uint(edata + (li - 32), 32);
+            *out_gssi = (v & 0x00FFFFFFu);
             *out_have_gssi = 1;
-        } else if (iei == 0x02 && blen == 1 && out_cck_id && out_have_cck) {
-            *out_cck_id = (uint8_t)bits_to_uint(bits + pos, 8);
+        } else if (tid == 0x6 && li >= 8 && out_cck_id && out_have_cck) {
+            /* CCK information: CCK_identifier (we take the last octet) */
+            uint32_t v = bits_to_uint(edata + (li - 8), 8);
+            *out_cck_id = (uint8_t)v;
             *out_have_cck = 1;
-        } else if (iei == 0x03 && blen == 1 && out_auth_ok && out_have_auth) {
-            *out_auth_ok = (uint8_t)(bits_to_uint(bits + pos, 1) & 1u);
+        } else if (tid == 0xA && li >= 1 && out_auth_ok && out_have_auth) {
+            /* Authentication downlink: treat LSB as auth_ok flag (network specific); still useful. */
+            uint32_t v = bits_to_uint(edata + (li - 1), 1);
+            *out_auth_ok = (uint8_t)(v & 1u);
             *out_have_auth = 1;
-        } else if (iei == 0x04 && blen == 1 && out_roam_lu && out_have_roam_lu) {
-            *out_roam_lu = (uint8_t)(bits_to_uint(bits + pos, 1) & 1u);
+        }
+
+        /* Heuristics for roaming / ITSI attach flags:
+           Some networks include these as 1-bit flags inside the same type-3 element payload.
+           We keep the older "best-effort" semantics: if present, take the last bit(s). */
+        if (tid == 0x2 && li >= 1 && out_roam_lu && out_have_roam_lu) {
+            uint32_t v = bits_to_uint(edata + (li - 1), 1);
+            *out_roam_lu = (uint8_t)(v & 1u);
             *out_have_roam_lu = 1;
-        } else if (iei == 0x05 && blen == 1 && out_itsi_attach && out_have_itsi_attach) {
-            *out_itsi_attach = (uint8_t)(bits_to_uint(bits + pos, 1) & 1u);
+        }
+        if (tid == 0x2 && li >= 2 && out_itsi_attach && out_have_itsi_attach) {
+            /* Often encoded as a separate flag bit; take second-last as a fallback. */
+            uint32_t v = bits_to_uint(edata + (li - 2), 1);
+            *out_itsi_attach = (uint8_t)(v & 1u);
             *out_have_itsi_attach = 1;
         }
 
-        pos += ie_bits;
+        pos += elem_bits_total;
     }
 }
+
 
 static void mm_try_pretty_log(uint32_t issi, uint16_t la,
                               const uint8_t *mm_bits, unsigned int mm_len_bits)
@@ -154,12 +191,12 @@ static void mm_try_pretty_log(uint32_t issi, uint16_t la,
 
         if (have_gssi) {
             mm_logf_ctx(issi, la,
-                "MS request for registration/authentication ACCEPTED for SSI: %u GSSI: %u - Authentication successful or no authentication currently in progress%s",
-                issi, gssi, tail);
+                "MS request for registration/authentication accepted - location update/registration successful or no authentication currently in progress - GSSI: %u%s",
+                (unsigned)gssi, tail);
         } else {
             mm_logf_ctx(issi, la,
-                "MS request for registration/authentication ACCEPTED for SSI: %u - Authentication successful or no authentication currently in progress%s",
-                issi, tail);
+                "MS request for registration/authentication accepted - location update/registration successful or no authentication currently in progress%s",
+                tail);
         }
     }
 
