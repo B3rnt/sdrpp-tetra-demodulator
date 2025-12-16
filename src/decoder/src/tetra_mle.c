@@ -39,6 +39,7 @@ static const char *mm_auth_subtype_str(uint8_t st) {
 static void mm_scan_type34_elements(const uint8_t *bits, unsigned int bitlen,
                                    unsigned int start_bit,
                                    uint32_t *out_gssi, uint8_t *out_have_gssi,
+                                   uint32_t *out_gssi_list, uint8_t *out_gssi_count, uint8_t out_gssi_max,
                                    uint8_t *out_cck_id, uint8_t *out_have_cck,
                                    uint8_t *out_auth_ok, uint8_t *out_have_auth,
                                    uint8_t *out_roam_lu, uint8_t *out_have_roam_lu,
@@ -50,6 +51,7 @@ static void mm_scan_type34_elements(const uint8_t *bits, unsigned int bitlen,
        (See TS 100 392-5, clause describing figure "Structure of type 3 Element Identifier"). */
 
     if (out_have_gssi) *out_have_gssi = 0;
+    if (out_gssi_count) *out_gssi_count = 0;
     if (out_have_cck)  *out_have_cck  = 0;
     if (out_have_auth) *out_have_auth = 0;
     if (out_have_roam_lu) *out_have_roam_lu = 0;
@@ -57,38 +59,80 @@ static void mm_scan_type34_elements(const uint8_t *bits, unsigned int bitlen,
 
     if (!bits || bitlen <= start_bit) return;
 
+    /*
+     * Robust scanning strategy:
+     * Some networks do *not* place Type-3 elements immediately after the MM PDU type field.
+     * Instead of assuming a contiguous list of descriptors, we do a sliding-window scan
+     * for plausible Type-3 descriptors (M=1, LI sane) and then jump over the element.
+     */
     unsigned int pos = start_bit;
 
     while (pos + 16 <= bitlen) {
-        /* Descriptor (2 octets / 16 bits) */
-        uint32_t mbit = bits_to_uint(bits + pos, 1); pos += 1;
-        uint32_t tid  = bits_to_uint(bits + pos, 4); pos += 4;   /* Type-3 MM element identifier */
-        uint32_t li   = bits_to_uint(bits + pos, 11); pos += 11; /* Length Indicator in bits */
+        /* Peek descriptor at current bit offset (do NOT advance unless it's plausible) */
+        uint32_t mbit = bits_to_uint(bits + pos, 1);
+        uint32_t tid  = bits_to_uint(bits + pos + 1, 4);
+        uint32_t li   = bits_to_uint(bits + pos + 5, 11);
 
-        if (mbit == 0 || li == 0) {
-            /* Not present; per spec remaining bits are 0, but we still continue scanning
-               because some networks/devices do not strictly follow this for multiple elements. */
+        /* Quick plausibility checks to avoid false positives */
+        if (mbit != 1u || li == 0u || li > 2047u) {
+            pos += 1;
             continue;
         }
 
-        /* Convert LI (bits) to octet length. */
         unsigned int elem_octets = 1u + (unsigned int)((li - 1u) / 8u);
-        unsigned int elem_bits_total = elem_octets * 8u;
+        unsigned int elem_bits_total = 16u + elem_octets * 8u;
+        if (pos + elem_bits_total > bitlen) {
+            pos += 1;
+            continue;
+        }
 
-        if (pos + elem_bits_total > bitlen) break;
-
-        /* User data is right-aligned: skip leading unused bits in the first octet. */
-        unsigned int unused = elem_bits_total - (unsigned int)li;
-        const uint8_t *edata = bits + pos + unused;
+        /* User data is right-aligned within elem_octets octets */
+        unsigned int unused = (elem_octets * 8u) - (unsigned int)li;
+        const uint8_t *edata = bits + pos + 16u + unused;
 
         /* Best-effort extraction of the fields SDR-TETRA shows in the summary line. */
-        if ((tid == 0x5 || tid == 0x7) && li >= 32 && out_gssi && out_have_gssi) {
-            /* Group identity location accept (0x5) may contain subelements; the "Group identity downlink"
-               subelement is 4 octets and carries the GSSI in the least significant 24 bits. The standalone
-               "Group identity downlink" Type-3 element (0x7) is also 4 octets. */
-            uint32_t v = bits_to_uint(edata + (li - 32), 32);
-            *out_gssi = (v & 0x00FFFFFFu);
-            *out_have_gssi = 1;
+        if ((tid == 0x5 || tid == 0x7) && li >= 32) {
+            /*
+             * 0x5: Group identity location accept (can embed one or more 32-bit "group identity downlink" items)
+             * 0x7: Group identity downlink (often exactly 32 bits)
+             *
+             * ETSI describes GSSI as 24 bits inside the group identity. In practice we:
+             *  - Prefer the LAST 32 bits (matches many traces)
+             *  - Also scan for any other 32-bit-aligned chunks and keep a small unique list.
+             */
+            /* helper: add unique GSSI into caller-provided list */
+            #define ADD_GSSI(_g) do { \
+                uint32_t __g = (_g) & 0x00FFFFFFu; \
+                if (__g != 0u && out_gssi_list && out_gssi_count && out_gssi_max) { \
+                    uint8_t __n = *out_gssi_count; \
+                    uint8_t __dup = 0; \
+                    for (uint8_t __i = 0; __i < __n; __i++) { if (out_gssi_list[__i] == __g) { __dup = 1; break; } } \
+                    if (!__dup && __n < out_gssi_max) { out_gssi_list[__n++] = __g; *out_gssi_count = __n; } \
+                } \
+            } while (0)
+
+            /* preferred: last 32 bits */
+            uint32_t v_last = bits_to_uint(edata + (li - 32), 32);
+            ADD_GSSI(v_last);
+
+            /* scan other 32-bit windows on byte boundaries */
+            unsigned int scan_bits = li;
+            unsigned int scan_start = 0;
+            while (scan_start + 32u <= scan_bits) {
+                if ((scan_start % 8u) == 0u) {
+                    uint32_t v = bits_to_uint(edata + scan_start, 32);
+                    ADD_GSSI(v);
+                }
+                scan_start += 8u;
+            }
+
+            #undef ADD_GSSI
+
+            /* keep legacy single-value outputs (first item in list) */
+            if (out_gssi && out_have_gssi && out_gssi_count && *out_gssi_count) {
+                *out_gssi = out_gssi_list[0] & 0x00FFFFFFu;
+                *out_have_gssi = 1;
+            }
         } else if (tid == 0x6 && li >= 8 && out_cck_id && out_have_cck) {
             /* CCK information: CCK_identifier (we take the last octet) */
             uint32_t v = bits_to_uint(edata + (li - 8), 8);
@@ -116,6 +160,7 @@ static void mm_scan_type34_elements(const uint8_t *bits, unsigned int bitlen,
             *out_have_itsi_attach = 1;
         }
 
+        /* Jump over the element we just consumed */
         pos += elem_bits_total;
     }
 }
@@ -145,6 +190,8 @@ static void mm_try_pretty_log(uint32_t issi, uint16_t la,
 
     uint32_t gssi = 0;
     uint8_t  have_gssi = 0;
+    uint32_t gssi_list[8];
+    uint8_t  gssi_count = 0;
     uint8_t  cck_id = 0;
     uint8_t  have_cck = 0;
     uint8_t  auth_ok = 0;
@@ -156,6 +203,7 @@ static void mm_try_pretty_log(uint32_t issi, uint16_t la,
 
     mm_scan_type34_elements(mm_bits, mm_len_bits, 4,
                            &gssi, &have_gssi,
+                           gssi_list, &gssi_count, (uint8_t)(sizeof(gssi_list) / sizeof(gssi_list[0])),
                            &cck_id, &have_cck,
                            &auth_ok, &have_auth,
                            &roam_lu, &have_roam_lu,
@@ -190,9 +238,28 @@ static void mm_try_pretty_log(uint32_t issi, uint16_t la,
         }
 
         if (have_gssi) {
-            mm_logf_ctx(issi, la,
-                "MS request for registration/authentication accepted - location update/registration successful or no authentication currently in progress - GSSI: %u%s",
-                (unsigned)gssi, tail);
+            char gbuf[128];
+            gbuf[0] = 0;
+            if (gssi_count > 1) {
+                /* show a short list of unique GSSI values we detected */
+                size_t o = 0;
+                for (uint8_t i = 0; i < gssi_count; i++) {
+                    char tmp[24];
+                    snprintf(tmp, sizeof(tmp), "%s%u", (i ? "," : ""), (unsigned)(gssi_list[i] & 0x00FFFFFFu));
+                    size_t tl = strlen(tmp);
+                    if (o + tl + 1 >= sizeof(gbuf)) break;
+                    memcpy(gbuf + o, tmp, tl);
+                    o += tl;
+                    gbuf[o] = 0;
+                }
+                mm_logf_ctx(issi, la,
+                    "MS request for registration/authentication accepted - location update/registration successful or no authentication currently in progress - GSSI(s): %s%s",
+                    gbuf, tail);
+            } else {
+                mm_logf_ctx(issi, la,
+                    "MS request for registration/authentication accepted - location update/registration successful or no authentication currently in progress - GSSI: %u%s",
+                    (unsigned)gssi, tail);
+            }
         } else {
             mm_logf_ctx(issi, la,
                 "MS request for registration/authentication accepted - location update/registration successful or no authentication currently in progress%s",
