@@ -20,14 +20,10 @@ extern "C" {
 #define GN_Ciphering_parameters 390
 #define GN_MM_Address_extension 391
 #define GN_Group_identity_report 392
+#define GN_Group_identity_acknowledgement_request 393
+#define GN_Group_identity_attach_detach_mode 394
+#define GN_Group_identity_accept_reject 395
 #define GN_MM_SSI 397
-
-/* Additional MM fields used by SDR# Class18 rules_4 / rules_5 */
-#define GN_Group_identity_acknowledgement_request 408
-#define GN_Group_identity_attach_detach_mode 409
-
-/* Used by rules_5 (Attach/Detach Group Identity Ack) */
-#define GN_Group_identity_accept_reject 384
 
 /* Subset of SDR# RulesType */
 typedef enum {
@@ -75,11 +71,11 @@ extern const size_t  mm_rules_loc_upd_proceeding_count;
 extern const mm_rule mm_rules_loc_upd_reject[];
 extern const size_t  mm_rules_loc_upd_reject_count;
 
-extern const mm_rule mm_rules_att_det_group_id[];
-extern const size_t  mm_rules_att_det_group_id_count;
+extern const mm_rule mm_rules_att_det_grp[];
+extern const size_t  mm_rules_att_det_grp_count;
 
-extern const mm_rule mm_rules_att_det_group_id_ack[];
-extern const size_t  mm_rules_att_det_group_id_ack_count;
+extern const mm_rule mm_rules_att_det_grp_ack[];
+extern const size_t  mm_rules_att_det_grp_ack_count;
 
 #ifdef __cplusplus
 }

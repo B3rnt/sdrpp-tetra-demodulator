@@ -128,7 +128,7 @@ const mm_rule mm_rules_loc_upd_accept[] = {
 };
 const size_t mm_rules_loc_upd_accept_count = sizeof(mm_rules_loc_upd_accept)/sizeof(mm_rules_loc_upd_accept[0]);
 
-/* rules_1: Location Update COMMAND (Group identity report + cipher control) */
+/* rules_1: Location Update COMMAND (Group identity report + cipher fields) */
 const mm_rule mm_rules_loc_upd_command[] = {
     { GN_Group_identity_report,   1,  MMRT_Direct, 0, 0, 0 },
     { GN_Cipher_control,          1,  MMRT_Direct, 0, 0, 0 },
@@ -141,9 +141,9 @@ const size_t mm_rules_loc_upd_command_count = sizeof(mm_rules_loc_upd_command)/s
 
 /* rules_3: Location Update PROCEEDING */
 const mm_rule mm_rules_loc_upd_proceeding[] = {
-    { GN_MM_SSI,                24, MMRT_Direct, 0, 0, 0 },
-    { GN_MM_Address_extension,  24, MMRT_Direct, 0, 0, 0 },
-    { GN_Options_bit,            1, MMRT_Options_bit, 0, 0, 0 },
+    { GN_MM_SSI,                  24, MMRT_Direct, 0, 0, 0 },
+    { GN_MM_Address_extension,    24, MMRT_Direct, 0, 0, 0 },
+    { GN_Options_bit,             1,  MMRT_Options_bit, 0, 0, 0 },
 };
 const size_t mm_rules_loc_upd_proceeding_count = sizeof(mm_rules_loc_upd_proceeding)/sizeof(mm_rules_loc_upd_proceeding[0]);
 
@@ -160,18 +160,18 @@ const mm_rule mm_rules_loc_upd_reject[] = {
 const size_t mm_rules_loc_upd_reject_count = sizeof(mm_rules_loc_upd_reject)/sizeof(mm_rules_loc_upd_reject[0]);
 
 /* rules_4: Attach/Detach Group Identity */
-const mm_rule mm_rules_att_det_group_id[] = {
-    { GN_Group_identity_report,                  1, MMRT_Direct, 0, 0, 0 },
-    { GN_Group_identity_acknowledgement_request, 1, MMRT_Direct, 0, 0, 0 },
-    { GN_Group_identity_attach_detach_mode,      1, MMRT_Direct, 0, 0, 0 },
-    { GN_Options_bit,                            1, MMRT_Options_bit, 0, 0, 0 },
+const mm_rule mm_rules_att_det_grp[] = {
+    { GN_Group_identity_report,                    1, MMRT_Direct, 0, 0, 0 },
+    { GN_Group_identity_acknowledgement_request,   1, MMRT_Direct, 0, 0, 0 },
+    { GN_Group_identity_attach_detach_mode,        1, MMRT_Direct, 0, 0, 0 },
+    { GN_Options_bit,                              1, MMRT_Options_bit, 0, 0, 0 },
 };
-const size_t mm_rules_att_det_group_id_count = sizeof(mm_rules_att_det_group_id)/sizeof(mm_rules_att_det_group_id[0]);
+const size_t mm_rules_att_det_grp_count = sizeof(mm_rules_att_det_grp)/sizeof(mm_rules_att_det_grp[0]);
 
-/* rules_5: Attach/Detach Group Identity Acknowledgement */
-const mm_rule mm_rules_att_det_group_id_ack[] = {
+/* rules_5: Attach/Detach Group Identity ACK */
+const mm_rule mm_rules_att_det_grp_ack[] = {
     { GN_Group_identity_accept_reject, 1, MMRT_Direct, 0, 0, 0 },
     { GN_Reserved,                     1, MMRT_Reserved, 0, 0, 0 },
     { GN_Options_bit,                  1, MMRT_Options_bit, 0, 0, 0 },
 };
-const size_t mm_rules_att_det_group_id_ack_count = sizeof(mm_rules_att_det_group_id_ack)/sizeof(mm_rules_att_det_group_id_ack[0]);
+const size_t mm_rules_att_det_grp_ack_count = sizeof(mm_rules_att_det_grp_ack)/sizeof(mm_rules_att_det_grp_ack[0]);
