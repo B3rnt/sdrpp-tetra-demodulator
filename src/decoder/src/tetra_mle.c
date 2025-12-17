@@ -76,14 +76,13 @@ static void add_gssi_to_list(uint32_t gssi, uint32_t *list, uint8_t *count, uint
         list[(*count)++] = gssi;
 }
 
-/* ---------- Type-3/4 element parsing (CORRECTED) ---------- */
+/* ---------- Type-3/4 element parsing (MATCHING CLASS18.CS) ---------- */
 
 /*
  * Group identity location accept (TID=0x5)
- * Structure based on Class18.cs and ETSI EN 300 392-2:
- * Loop:
- * 1 bit:  Group identity attachment mode (0=Attach, 1=Detach)
- * 2 bits: Group identity type
+ * Logic derived strictly from Class18.cs (Case 32U):
+ * It reads 2 bits for Type directly. It does NOT skip a Mode bit in this loop.
+ * * 2 bits: Group identity type
  * 00: GSSI (24 bits)
  * 01: GSSI (24 bits) + Extension (24 bits)
  * 10: Visitor GSSI (24 bits)
@@ -93,20 +92,16 @@ static void mm_parse_group_identity_location_accept(const uint8_t *bits, unsigne
                                                     uint32_t *out_gssi_list, uint8_t *out_gssi_count, uint8_t out_gssi_max,
                                                     uint32_t *out_gssi0, uint8_t *out_have_gssi0)
 {
-    if (!bits || bitlen < 3)
+    if (!bits || bitlen < 2)
         return;
 
     unsigned int p = 0;
     
-    // We need at least 3 bits (1 mode + 2 type) to start a cycle
-    while (p + 3u <= bitlen) {
+    // We need at least 2 bits for Type to start
+    while (p + 2u <= bitlen) {
         
-        // --- FIX: Read 1 bit Attachment Mode ---
-        // We ignore the value for now, but we MUST advance the pointer.
-        // uint8_t mode = (uint8_t)get_bits(bits, bitlen, p, 1);
-        p += 1; 
-
         // --- Read 2 bits Type ---
+        // Class18.cs: int num20 = Class34.smethod_3(..., 2);
         uint8_t type = (uint8_t)get_bits(bits, bitlen, p, 2);
         p += 2;
 
@@ -131,7 +126,6 @@ static void mm_parse_group_identity_location_accept(const uint8_t *bits, unsigne
         } 
         else if (type == 1) {
             // --- Type 1: GSSI (24 bits) + Extension (24 bits) ---
-            // Total 48 bits needed
             if (p + 48u > bitlen) break;
             
             // First 24 bits: GSSI
@@ -206,10 +200,10 @@ static int t34_parse_chain(const uint8_t *bits, unsigned int nbits, unsigned int
     unsigned int limit = start_pos + max_bits_from_start;
     if (limit > nbits) limit = nbits;
 
-    /* sanity: must have at least one header */
+    /* sanity: must have at least one header (1 bit M + 4 bit TID + 11 bit LI = 16 bits) */
     if (pos + 16u > limit) return 0;
 
-    /* first header must look plausible */
+    /* first header must have M-bit = 1 to exist */
     if (get_bits(bits, nbits, pos, 1) != 1) return 0;
 
     while (pos + 16u <= limit) {
@@ -222,7 +216,9 @@ static int t34_parse_chain(const uint8_t *bits, unsigned int nbits, unsigned int
 
         uint32_t tid = get_bits(bits, nbits, pos + 1, 4);
         uint32_t li  = get_bits(bits, nbits, pos + 5, 11);
-        if (li == 0 || li > 1024) return 0;
+        
+        /* Sanity check LI */
+        if (li > 2048) return 0;
 
         unsigned int elem_len = 16u + (unsigned int)li;
         if (pos + elem_len > limit) return 0;
@@ -344,32 +340,30 @@ static void mm_log_loc_upd_acc_sdrtetra_style(uint32_t issi, uint16_t la,
                                               const struct t34_result *r,
                                               uint8_t append_auth_ok)
 {
-    char tail[256];
+    char tail[512];
     tail[0] = 0;
 
     if (append_auth_ok) {
         strncat(tail,
                 " - Authentication successful or no authentication currently in progress",
-                sizeof(tail) - strlen(tail) - 1);
+                500);
     }
 
     if (r && r->have_cck) {
         char tmp[64];
         snprintf(tmp, sizeof(tmp), " - CCK_identifier: %u", (unsigned)r->cck);
-        strncat(tail, tmp, sizeof(tail) - strlen(tail) - 1);
+        strncat(tail, tmp, 500 - strlen(tail));
     }
 
     if (r) {
         /* SDRTetra: in jouw logs zie je vaak roaming. ITSI attach kan ook voorkomen. */
         if (r->have_itsi && r->itsi) {
-            strncat(tail, " - ITSI attach", sizeof(tail) - strlen(tail) - 1);
+            strncat(tail, " - ITSI attach", 500 - strlen(tail));
         } else if (r->have_roam && r->roam) {
             if (r->have_srv_rest && r->srv_rest) {
-                strncat(tail, " - Service restoration roaming location updating",
-                        sizeof(tail) - strlen(tail) - 1);
+                strncat(tail, " - Service restoration roaming location updating", 500 - strlen(tail));
             } else {
-                strncat(tail, " - Roaming location updating",
-                        sizeof(tail) - strlen(tail) - 1);
+                strncat(tail, " - Roaming location updating", 500 - strlen(tail));
             }
         }
     }
@@ -433,14 +427,21 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
                         score = (st == 0 || st == 2) ? 95 : 70;
                     }
                 } else if (type == TMM_PDU_T_D_LOC_UPD_ACC) {
-                    unsigned int payload_start = toff + 4;
+                    /*
+                     * START OFFSET FIX:
+                     * Start searching for TLVs well after the header to avoid the ISSI (24 bits)
+                     * masquerading as a GSSI or CCK header.
+                     * Header(4) + Type(3) + SSI(24) = 31 bits. 
+                     * So toff + 32 is a safe starting point to scan for optional elements.
+                     */
+                    unsigned int payload_start = toff + 32;
 
                     /* Find best TLV chain soon after payload_start */
                     struct t34_result r;
-                    int t34 = find_best_t34_chain(bits, nbits, payload_start, 512u, 2048u, &r);
+                    int t34 = find_best_t34_chain(bits, nbits, payload_start, 1024u, 2048u, &r);
                     if (t34 >= 0) {
                         score = 110;
-                        if (r.have_cck) score += 10;
+                        if (r.have_cck) score += 20; /* High boost for CCK presence */
                         if (r.gssi_count > 0) score += 10;
                     } else {
                         score = 80;
@@ -548,11 +549,15 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
     }
 
     if (type == TMM_PDU_T_D_LOC_UPD_ACC) {
-        unsigned int payload_start = toff + 4;
+        /* * FIX: Start scanning for TLVs after the mandatory fields + ISSI.
+         * Header (4) + LocUpdType (3) + ISSI (24) = 31 bits. 
+         * Safest start is 32 bits after type offset.
+         */
+        unsigned int payload_start = toff + 32;
 
         /* decode fixed header fields (optional, for future); we mainly want TLVs */
         mm_field_store fs = {0};
-        (void)mm_rules_decode(bits, nbits, payload_start,
+        (void)mm_rules_decode(bits, nbits, toff + 4,
                               mm_rules_loc_upd_accept, mm_rules_loc_upd_accept_count,
                               &fs);
 
