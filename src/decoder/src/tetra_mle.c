@@ -22,23 +22,12 @@ static uint32_t get_bits(const uint8_t *bits, unsigned int len, unsigned int pos
     return val;
 }
 
-/* ---------- DEBUG ---------- */
-#ifndef MM_DEBUG_BITS
-#define MM_DEBUG_BITS 0
-#endif
-
-#if MM_DEBUG_BITS
-static void mm_log_debug(uint32_t issi, const char *msg) {
-    // printf("[MM DEBUG ISSI=%u] %s\n", issi, msg);
-}
-#endif
-
-/* ---------- STATE ---------- */
+/* ===================== STATE ===================== */
 
 static uint32_t g_last_auth_issi = 0;
 static uint8_t  g_last_auth_ok = 0;
 
-/* ---------- RESULT STRUCTURE ---------- */
+/* ===================== TLV PARSER ===================== */
 
 struct t34_result {
     uint32_t gssi_list[8];
@@ -51,6 +40,10 @@ struct t34_result {
     uint8_t  itsi;
     uint8_t  have_srv_rest;
     uint8_t  srv_rest;
+    
+    /* Internal metrics for scoring */
+    uint8_t  valid_structure; 
+    unsigned int bits_consumed;
 };
 
 static void t34_result_init(struct t34_result *r)
@@ -59,284 +52,246 @@ static void t34_result_init(struct t34_result *r)
     memset(r, 0, sizeof(*r));
 }
 
-static void add_gssi_to_list(uint32_t gssi, struct t34_result *out)
+static void add_gssi(uint32_t gssi, struct t34_result *out)
 {
-    if (!out || gssi == 0) return;
-    for (uint8_t i = 0; i < out->gssi_count; i++) {
-        if (out->gssi_list[i] == gssi) return;
-    }
-    if (out->gssi_count < 8)
-        out->gssi_list[out->gssi_count++] = gssi;
+    if (gssi == 0 || out->gssi_count >= 8) return;
+    for(int i=0; i<out->gssi_count; i++) if(out->gssi_list[i] == gssi) return;
+    out->gssi_list[out->gssi_count++] = gssi;
 }
 
-/* ---------- PARSING LOGIC ---------- */
-
-/*
- * TID 5: Group identity location accept
- * Structure: Loop [Mode(1) + Type(2) + Value(24/48)]
+/* * Parses TID 5 (Group identity location accept)
+ * Uses Standard TETRA structure: [1 bit Mode] [2 bits Type] [Value]
  */
-static void parse_tid5_group_identity(const uint8_t *bits, unsigned int nbits, unsigned int offset, unsigned int len, struct t34_result *out)
+static void parse_tid5(const uint8_t *bits, unsigned int bitlen, unsigned int offset, unsigned int len, struct t34_result *out)
 {
     unsigned int p = 0;
-    
-    // We need at least 3 bits (1 Mode + 2 Type)
     while (p + 3 <= len) {
-        
-        // 1. Attachment Mode (1 bit)
-        // We read and skip this bit to stay aligned.
-        // uint8_t mode = get_bits(bits, nbits, offset + p, 1);
-        p += 1;
+        // 1. Mode (1 bit) - Skip but consume
+        p += 1; 
 
-        // 2. Group identity type (2 bits)
-        uint8_t type = (uint8_t)get_bits(bits, nbits, offset + p, 2);
+        // 2. Type (2 bits)
+        uint8_t type = (uint8_t)get_bits(bits, bitlen, offset + p, 2);
         p += 2;
 
-        if (type == 3) break; // Stop/Reserved
+        if (type == 3) break; // Stop
 
         if (type == 0) { // GSSI (24)
             if (p + 24 > len) break;
-            uint32_t gssi = get_bits(bits, nbits, offset + p, 24);
-            add_gssi_to_list(gssi, out);
+            add_gssi(get_bits(bits, bitlen, offset + p, 24), out);
             p += 24;
-        } 
-        else if (type == 1) { // GSSI (24) + Ext (24)
+        } else if (type == 1) { // GSSI(24) + Ext(24)
             if (p + 48 > len) break;
-            uint32_t gssi = get_bits(bits, nbits, offset + p, 24);
-            add_gssi_to_list(gssi, out);
+            add_gssi(get_bits(bits, bitlen, offset + p, 24), out);
             p += 24;
-            
-            uint32_t ext = get_bits(bits, nbits, offset + p, 24);
-            add_gssi_to_list(ext, out); // SDRTetra treats ext as secondary GSSI
+            add_gssi(get_bits(bits, bitlen, offset + p, 24), out);
             p += 24;
-        } 
-        else if (type == 2) { // Visitor GSSI (24)
+        } else if (type == 2) { // Visitor GSSI (24)
             if (p + 24 > len) break;
-            uint32_t vgssi = get_bits(bits, nbits, offset + p, 24);
-            add_gssi_to_list(vgssi, out);
+            add_gssi(get_bits(bits, bitlen, offset + p, 24), out);
             p += 24;
         }
     }
 }
 
 /*
- * TLV Chain Parser (Type 3/4)
- * Starts at 'pos' (which should be the first M-bit).
+ * Tries to parse a TLV chain starting at 'start_pos'.
+ * Returns 1 if structure looks valid (M-bit loop allows clean exit), 0 if corrupt.
  */
-static void parse_tlv_chain(const uint8_t *bits, unsigned int nbits, unsigned int *pos_ptr, struct t34_result *out)
+static int t34_try_parse(const uint8_t *bits, unsigned int nbits, unsigned int start_pos, struct t34_result *out)
 {
-    unsigned int pos = *pos_ptr;
+    t34_result_init(out);
+    unsigned int pos = start_pos;
+
+    // Sanity check: First M-bit must be 1. 
+    // (In D-Location Update Accept, the O-bit enables the chain. 
+    // If we assume start_pos is AT the first M-bit of the first element).
+    // Note: Sometimes the O-bit IS the M-bit for the first element conceptually.
+    // We scan looking for a valid header: M=1, TID=valid, LEN=valid.
     
-    while (pos + 16 <= nbits) { // Header overhead: M(1) + Type(4) + Len(11) = 16 bits
-        
-        // M-bit
+    if (pos + 16 > nbits) return 0;
+    if (get_bits(bits, nbits, pos, 1) != 1) return 0; // First element MUST have M=1
+
+    while (pos + 16 <= nbits) {
         uint32_t m_bit = get_bits(bits, nbits, pos, 1);
         pos += 1;
 
         if (m_bit == 0) {
-            break; // End of chain
+            out->valid_structure = 1;
+            out->bits_consumed = pos - start_pos;
+            return 1; // Clean exit
         }
 
-        // Type (4 bits)
         uint32_t tid = get_bits(bits, nbits, pos, 4);
         pos += 4;
-
-        // Length (11 bits)
         uint32_t li = get_bits(bits, nbits, pos, 11);
         pos += 11;
 
-        if (li > 2048 || pos + li > nbits) break;
+        if (li > 2048 || pos + li > nbits) return 0; // Corrupt length
 
         unsigned int val_start = pos;
 
-        if (tid == 0x5) { 
-            // Group identity location accept
-            parse_tid5_group_identity(bits, nbits, val_start, li, out);
-        }
-        else if (tid == 0x6) { 
-            // CCK identifier (usually 8 bits, often at the end of the LI block)
-            if (li >= 8) {
-                // Class18 reads it directly. Usually it's just 8 bits payload.
-                out->cck = (uint8_t)get_bits(bits, nbits, val_start, 8);
-                out->have_cck = 1;
-            }
-        }
-        else if (tid == 0x2) { 
-            // Info (Roaming / ITSI attach)
-            unsigned int local_p = 0;
-            if (li > local_p) { out->roam = (uint8_t)get_bits(bits, nbits, val_start + local_p++, 1); out->have_roam = 1; }
-            if (li > local_p) { out->itsi = (uint8_t)get_bits(bits, nbits, val_start + local_p++, 1); out->have_itsi = 1; }
-            if (li > local_p) { out->srv_rest = (uint8_t)get_bits(bits, nbits, val_start + local_p++, 1); out->have_srv_rest = 1; }
+        if (tid == 0x5) {
+            parse_tid5(bits, nbits, val_start, li, out);
+        } else if (tid == 0x6 && li >= 8) {
+            out->cck = (uint8_t)get_bits(bits, nbits, val_start, 8);
+            out->have_cck = 1;
+        } else if (tid == 0x2) {
+            unsigned int lp = 0;
+            if (li > lp) { out->roam = (uint8_t)get_bits(bits, nbits, val_start+lp++, 1); out->have_roam = 1; }
+            if (li > lp) { out->itsi = (uint8_t)get_bits(bits, nbits, val_start+lp++, 1); out->have_itsi = 1; }
+            if (li > lp) { out->srv_rest = (uint8_t)get_bits(bits, nbits, val_start+lp++, 1); out->have_srv_rest = 1; }
+        } else if (tid != 0x7) {
+            // Unknown TID, but structure might be valid, continue skipping
+        } else if (tid == 0x7 && li >= 24) {
+             add_gssi(get_bits(bits, nbits, val_start, 24), out);
         }
 
         pos += li;
     }
     
-    *pos_ptr = pos;
+    return 0; // Ran out of bits without M=0
 }
 
-/*
- * HEADER PARSER
- * Parses the D-LOCATION UPDATE ACCEPT header exactly according to Class18.cs rules_0.
- * This ensures we land on the exact correct bit for the TLV chain.
- */
-static int parse_loc_upd_acc(const uint8_t *bits, unsigned int nbits, unsigned int start_off, struct t34_result *out)
-{
-    unsigned int p = start_off;
+/* ===================== LOGGING ===================== */
 
-    // 1. Location update accept type (3 bits)
-    if (p + 3 > nbits) return 0;
-    p += 3;
-
-    // 2. Options bit (1 bit) - Crucial! Determines if TLV follows.
-    if (p + 1 > nbits) return 0;
-    uint8_t has_tlv = (uint8_t)get_bits(bits, nbits, p, 1);
-    p += 1;
-
-    // --- Fixed Optional Fields (Presence Bits) ---
-    // Rule 1: SSI (24 bits)
-    if (p + 1 > nbits) return 0;
-    if (get_bits(bits, nbits, p++, 1)) {
-        if (p + 24 > nbits) return 0;
-        p += 24; 
-    }
-
-    // Rule 2: Address Extension (24 bits)
-    if (p + 1 > nbits) return 0;
-    if (get_bits(bits, nbits, p++, 1)) {
-        if (p + 24 > nbits) return 0;
-        p += 24;
-    }
-
-    // Rule 3: Subscriber Class (16 bits)
-    if (p + 1 > nbits) return 0;
-    if (get_bits(bits, nbits, p++, 1)) {
-        if (p + 16 > nbits) return 0;
-        p += 16;
-    }
-
-    // Rule 4: Energy Saving (14 bits)
-    if (p + 1 > nbits) return 0;
-    if (get_bits(bits, nbits, p++, 1)) {
-        if (p + 14 > nbits) return 0;
-        p += 14;
-    }
-
-    // Rule 5: Reserved (6 bits) - Matches Class18.cs rules_0 last entry
-    if (p + 1 > nbits) return 0;
-    if (get_bits(bits, nbits, p++, 1)) {
-        if (p + 6 > nbits) return 0;
-        p += 6;
-    }
-
-    // --- End of Header ---
-    
-    // If Options bit was 1, the Type 3/4 TLV chain starts here.
-    if (has_tlv) {
-        parse_tlv_chain(bits, nbits, &p, out);
-    }
-
-    return 1; // Success
-}
-
-/* ---------- Logging ---------- */
-
-static void mm_log_loc_upd_acc_sdrtetra_style(uint32_t issi, uint16_t la,
-                                              uint32_t ssi_out,
-                                              const struct t34_result *r,
-                                              uint8_t append_auth_ok)
+static void mm_log_result(uint32_t issi, uint16_t la, const struct t34_result *r)
 {
     char tail[512];
     tail[0] = 0;
 
-    if (append_auth_ok) {
+    // Check auth state
+    if (g_last_auth_ok && g_last_auth_issi == issi) {
         strncat(tail, " - Authentication successful or no authentication currently in progress", 500);
+        g_last_auth_ok = 0; // Reset
     }
 
-    if (r && r->have_cck) {
+    if (r->have_cck) {
         char tmp[64];
-        snprintf(tmp, sizeof(tmp), " - CCK_identifier: %u", (unsigned)r->cck);
+        snprintf(tmp, sizeof(tmp), " - CCK_identifier: %u", r->cck);
         strncat(tail, tmp, 500 - strlen(tail));
     }
 
-    if (r) {
-        if (r->have_itsi && r->itsi) {
-            strncat(tail, " - ITSI attach", 500 - strlen(tail));
-        } else if (r->have_roam && r->roam) {
-            if (r->have_srv_rest && r->srv_rest) 
-                strncat(tail, " - Service restoration roaming location updating", 500 - strlen(tail));
-            else 
-                strncat(tail, " - Roaming location updating", 500 - strlen(tail));
-        }
+    if (r->have_itsi && r->itsi) {
+        strncat(tail, " - ITSI attach", 500 - strlen(tail));
+    } else if (r->have_roam && r->roam) {
+        if (r->have_srv_rest && r->srv_rest) 
+            strncat(tail, " - Service restoration roaming location updating", 500 - strlen(tail));
+        else 
+            strncat(tail, " - Roaming location updating", 500 - strlen(tail));
     }
 
-    if (r && r->gssi_count > 0) {
+    if (r->gssi_count > 0) {
         mm_logf_ctx(issi, la, "MS request for registration/authentication ACCEPTED for SSI: %u GSSI: %u%s",
-                    (unsigned)ssi_out, (unsigned)r->gssi_list[0], tail);
+                    issi, r->gssi_list[0], tail);
     } else {
         mm_logf_ctx(issi, la, "MS request for registration/authentication ACCEPTED for SSI: %u%s",
-                    (unsigned)ssi_out, tail);
+                    issi, tail);
     }
 }
 
-/* ---------- Core Decoder ---------- */
+/* ===================== DECODER ===================== */
 
 static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
                                    const uint8_t *bits, unsigned int nbits,
                                    uint32_t issi, uint16_t la)
 {
     (void)tms;
-    if (!bits || nbits < 16) return 0;
+    if (!bits || nbits < 32) return 0;
 
-    // Scan window: start looking near the beginning
-    unsigned int limit = (nbits < 64) ? nbits : 64;
+    /* * Search strategy:
+     * MM header is usually at the start.
+     * PDU Type is 4 bits. We scan for Loc Upd Accept (D).
+     */
+    
+    // Limits for header scan
+    unsigned int scan_limit = (nbits < 64) ? nbits : 64;
 
-    for (unsigned int off = 0; off + 16u <= limit; off++) {
+    for (unsigned int off = 0; off + 16 <= scan_limit; off++) {
+        // Skip PDISC check logic for a moment, check patterns
         uint8_t pdisc = (uint8_t)get_bits(bits, nbits, off, 3);
         if (pdisc != TMLE_PDISC_MM) continue;
 
-        unsigned int type_off = off + 4; // Skip spare bit
-        if (type_off + 4 > nbits) continue;
+        // Try offset +3 and +4 for Type (spare bit handling)
+        unsigned int type_offs[] = { off + 4, off + 3 };
         
-        uint8_t type = (uint8_t)get_bits(bits, nbits, type_off, 4);
-
-        if (type == TMM_PDU_T_D_LOC_UPD_ACC) {
-            // Payload starts after Type (4 bits)
-            unsigned int payload_start = type_off + 4;
+        for (int i = 0; i < 2; i++) {
+            unsigned int toff = type_offs[i];
+            if (toff + 4 > nbits) continue;
             
-            struct t34_result r;
-            t34_result_init(&r);
+            uint8_t type = (uint8_t)get_bits(bits, nbits, toff, 4);
 
-            // Parse EXACTLY using Class18 rules to find TLV start
-            if (parse_loc_upd_acc(bits, nbits, payload_start, &r)) {
-                
-                uint8_t append_auth = 0;
-                if (g_last_auth_ok && g_last_auth_issi == issi) {
-                    append_auth = 1;
-                    g_last_auth_ok = 0;
+            if (type == TMM_PDU_T_D_AUTH) {
+                // Auth parsing logic (simple)
+                if (toff + 6 <= nbits) {
+                    uint8_t st = (uint8_t)get_bits(bits, nbits, toff + 4, 2);
+                    if (st == 0) mm_logf_ctx(issi, la, "BS demands authentication: SSI: %u", issi);
+                    else if (st == 2) {
+                        mm_logf_ctx(issi, la, "BS result to MS authentication: Authentication successful or no authentication currently in progress SSI: %u - Authentication successful or no authentication currently in progress", issi);
+                        g_last_auth_issi = issi;
+                        g_last_auth_ok = 1;
+                    }
+                    return 1;
                 }
-                mm_log_loc_upd_acc_sdrtetra_style(issi, la, issi, &r, append_auth);
-                return 1;
             }
-        }
-        else if (type == TMM_PDU_T_D_AUTH) {
-            if (type_off + 6 <= nbits) {
-                uint8_t st = (uint8_t)get_bits(bits, nbits, type_off + 4, 2);
-                if (st == 0) {
-                    mm_logf_ctx(issi, la, "BS demands authentication: SSI: %u", issi);
+            else if (type == TMM_PDU_T_D_LOC_UPD_ACC) {
+                // *** BRUTE FORCE SCANNER FOR TLV CHAIN ***
+                // The header has variable length. We skip the mandatory ISSI (24 bits) 
+                // and start scanning for a valid TLV chain structure.
+                // Start scanning 30 bits after Type.
+                
+                unsigned int scan_start = toff + 30;
+                unsigned int scan_end = (nbits > 128) ? 128 : nbits;
+                if (scan_start >= scan_end) continue;
+
+                struct t34_result best_r;
+                t34_result_init(&best_r);
+                int best_score = -1;
+
+                for (unsigned int p = scan_start; p < scan_end; p++) {
+                    struct t34_result r;
+                    if (t34_try_parse(bits, nbits, p, &r)) {
+                        // Calculate Score
+                        int score = 0;
+                        if (r.have_cck) score += 50;
+                        if (r.gssi_count > 0) score += 30;
+                        if (r.have_roam || r.have_itsi) score += 20;
+                        if (r.have_cck && r.cck == 63) score += 10; // Common value boost
+                        
+                        // Validity Check: bits consumed shouldn't exceed reasonable PDU size
+                        if (r.bits_consumed > 500) score = -1;
+
+                        if (score > best_score) {
+                            best_score = score;
+                            best_r = r;
+                        }
+                    }
+                }
+
+                if (best_score > 0) {
+                    mm_log_result(issi, la, &best_r);
                     return 1;
-                } else if (st == 2) {
-                    mm_logf_ctx(issi, la, "BS result to MS authentication: Authentication successful or no authentication currently in progress SSI: %u - Authentication successful or no authentication currently in progress", issi);
-                    g_last_auth_issi = issi;
-                    g_last_auth_ok = 1;
+                } else {
+                    // Log basic accept if no chain found
+                    struct t34_result empty; t34_result_init(&empty);
+                    mm_log_result(issi, la, &empty);
                     return 1;
                 }
+            }
+            // Add other types (CMD, REJ) here if needed for logs
+            else if (type == TMM_PDU_T_D_LOC_UPD_CMD) {
+                 mm_logf_ctx(issi, la, "SwMI sent LOCATION UPDATE COMMAND for SSI: %u", issi);
+                 return 1;
+            }
+            else if (type == TMM_PDU_T_D_LOC_UPD_REJ) {
+                 mm_logf_ctx(issi, la, "SwMI sent LOCATION UPDATE REJECT for SSI: %u", issi);
+                 return 1;
             }
         }
     }
     return 0;
 }
 
-/* ---------- MAIN ENTRY ---------- */
+/* ---------- ENTRY ---------- */
 
 int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
 {
@@ -350,16 +305,16 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
     static uint8_t bits_unpacked[4096];
     static uint8_t bits_packed[4096];
 
-    /* 1) Unpacked bits */
+    /* Unpacked */
     unsigned int nbits_u = 0;
-    unsigned int max_u = (len > sizeof(bits_unpacked)) ? sizeof(bits_unpacked) : len;
+    unsigned int max_u = (len > 4096) ? 4096 : len;
     for (unsigned int i = 0; i < max_u; i++) bits_unpacked[nbits_u++] = buf[i] & 1u;
 
     if (try_decode_mm_from_bits(tms, bits_unpacked, nbits_u, issi, la)) return (int)len;
 
-    /* 2) Packed bits (fallback) */
+    /* Packed */
     unsigned int max_p_bytes = len;
-    if (max_p_bytes * 8 > sizeof(bits_packed)) max_p_bytes = sizeof(bits_packed) / 8;
+    if (max_p_bytes * 8 > 4096) max_p_bytes = 4096 / 8;
     unsigned int nbits_p = 0;
     for (unsigned int i = 0; i < max_p_bytes; i++) {
         uint8_t b = buf[i];
