@@ -1,40 +1,16 @@
-
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
+/* * Zorg dat deze headers beschikbaar zijn in je project, 
+ * of vervang ze door je eigen definities als ze ontbreken.
+ */
 #include "tetra_mle_pdu.h"
 #include "tetra_mle.h"
 #include "mm_log.h"
 #include "tetra_mm_pdu.h"
 #include "mm_sdr_rules.h"
 #include "crypto/tetra_crypto.h"
-
-/*
- * SDRTetra-compat MM decoder voor LLC-bypass.
- *
- * Focus: D-LOC-UPD-ACC (registration accepted) moet net als SDRTetra:
- *   - GSSI (via Type-3/4 TID=0x5 of soms TID=0x7)
- *   - CCK_identifier (TID=0x6)
- *   - Roaming / service-restoration / ITSI attach flags (TID=0x2)
- *
- * De grote valkuil is alignment:
- *   - PDISC is 3 bits, maar er kan een spare/skip bit tussen PDISC en PDU-type zitten.
- *   - De Type-3/4 TLV chain begint niet altijd exact op (after_hdr); soms al direct na het PDU-type,
- *     en bij LLC-bypass kan er ook nog “rommel” in de bitstream zitten.
- *
- * Daarom doen we SDRTetra-achtig:
- *   1) Kies de beste MM header-alignment (PDISC + PDU-type) dicht bij het begin.
- *   2) Voor LOC_UPD_ACC zoeken we niet “de eerste TLV header”, maar de *beste TLV-chain* binnen een venster:
- *      we proberen elke plausibele TLV-start, parsen de hele chain, en scoren op:
- *        - chain kan volledig gelezen worden en eindigt netjes (M=0)
- *        - bevat CCK (TID=0x6)
- *        - bevat GSSI (TID=0x5/0x7) en/of roaming/itsi flags (TID=0x2)
- *      Zo voorkom je random CCK/GSSI uit false positives.
- *
- * Debug:
- *   Compile met -DMM_DEBUG_BITS=1 voor extra dumps.
- */
 
 /* ---------- BIT HELPERS ---------- */
 
@@ -85,7 +61,6 @@ static uint8_t  g_last_auth_ok = 0; /* subtype=2 */
 
 /* ---------- GSSI helpers ---------- */
 
-/* SDRTetra filtert in de praktijk niet hard; wij accepteren alle non-zero 24-bit waarden. */
 static void add_gssi_to_list(uint32_t gssi, uint32_t *list, uint8_t *count, uint8_t max)
 {
     if (!list || !count || max == 0)
@@ -101,58 +76,94 @@ static void add_gssi_to_list(uint32_t gssi, uint32_t *list, uint8_t *count, uint
         list[(*count)++] = gssi;
 }
 
-/* ---------- Type-3/4 element parsing ---------- */
+/* ---------- Type-3/4 element parsing (CORRECTED) ---------- */
 
 /*
  * Group identity location accept (TID=0x5)
- * selector 2 bits:
- *  0: 24-bit GSSI
- *  1: 24-bit GSSI + 24-bit extra (skip)
- *  2: 24-bit vGSSI
- *  3: stop
+ * Structure based on Class18.cs and ETSI EN 300 392-2:
+ * Loop:
+ * 1 bit:  Group identity attachment mode (0=Attach, 1=Detach)
+ * 2 bits: Group identity type
+ * 00: GSSI (24 bits)
+ * 01: GSSI (24 bits) + Extension (24 bits)
+ * 10: Visitor GSSI (24 bits)
+ * 11: Reserved / Stop
  */
 static void mm_parse_group_identity_location_accept(const uint8_t *bits, unsigned int bitlen,
                                                     uint32_t *out_gssi_list, uint8_t *out_gssi_count, uint8_t out_gssi_max,
                                                     uint32_t *out_gssi0, uint8_t *out_have_gssi0)
 {
-    if (!bits || bitlen < 2)
+    if (!bits || bitlen < 3)
         return;
 
     unsigned int p = 0;
-    while (p + 2u <= bitlen) {
-        uint8_t sel = (uint8_t)get_bits(bits, bitlen, p, 2);
+    
+    // We need at least 3 bits (1 mode + 2 type) to start a cycle
+    while (p + 3u <= bitlen) {
+        
+        // --- FIX: Read 1 bit Attachment Mode ---
+        // We ignore the value for now, but we MUST advance the pointer.
+        // uint8_t mode = (uint8_t)get_bits(bits, bitlen, p, 1);
+        p += 1; 
+
+        // --- Read 2 bits Type ---
+        uint8_t type = (uint8_t)get_bits(bits, bitlen, p, 2);
         p += 2;
 
-        if (sel == 3)
-            break;
+        if (type == 3) {
+            // Reserved / Stop condition
+            break; 
+        }
 
-        if (sel == 0 || sel == 1) {
-            if (p + 24u > bitlen)
-                break;
+        if (type == 0) {
+            // --- Type 0: Single GSSI (24 bits) ---
+            if (p + 24u > bitlen) break;
             uint32_t gssi = get_bits(bits, bitlen, p, 24);
             p += 24;
 
-            if (sel == 1) {
-                if (p + 24u > bitlen)
-                    break;
-                p += 24;
-            }
-
             if (gssi) {
-                uint8_t before = out_gssi_count ? *out_gssi_count : 0;
                 add_gssi_to_list(gssi, out_gssi_list, out_gssi_count, out_gssi_max);
-                uint8_t after = out_gssi_count ? *out_gssi_count : before;
-
-                if (after > before && out_gssi0 && out_have_gssi0 && !*out_have_gssi0) {
+                if (out_gssi0 && out_have_gssi0 && !*out_have_gssi0) {
                     *out_gssi0 = gssi;
                     *out_have_gssi0 = 1;
                 }
             }
-        } else if (sel == 2) {
-            /* vGSSI: momenteel niet gelogd, maar wel netjes vooruit lopen */
-            if (p + 24u > bitlen)
-                break;
+        } 
+        else if (type == 1) {
+            // --- Type 1: GSSI (24 bits) + Extension (24 bits) ---
+            // Total 48 bits needed
+            if (p + 48u > bitlen) break;
+            
+            // First 24 bits: GSSI
+            uint32_t gssi = get_bits(bits, bitlen, p, 24);
             p += 24;
+            
+            if (gssi) {
+                add_gssi_to_list(gssi, out_gssi_list, out_gssi_count, out_gssi_max);
+                if (out_gssi0 && out_have_gssi0 && !*out_have_gssi0) {
+                    *out_gssi0 = gssi;
+                    *out_have_gssi0 = 1;
+                }
+            }
+
+            // Second 24 bits: Extension (or secondary GSSI)
+            uint32_t ext_gssi = get_bits(bits, bitlen, p, 24);
+            p += 24;
+            
+            if (ext_gssi) {
+                add_gssi_to_list(ext_gssi, out_gssi_list, out_gssi_count, out_gssi_max);
+            }
+        } 
+        else if (type == 2) {
+            // --- Type 2: Visitor GSSI (24 bits) ---
+            if (p + 24u > bitlen) break;
+            
+            uint32_t vgssi = get_bits(bits, bitlen, p, 24);
+            p += 24;
+
+            if (vgssi) {
+                add_gssi_to_list(vgssi, out_gssi_list, out_gssi_count, out_gssi_max);
+            }
         }
     }
 }
