@@ -41,9 +41,12 @@ struct t34_result {
     uint8_t  have_srv_rest;
     uint8_t  srv_rest;
 
-    /* Internal metrics for scoring */
+    /* Internal metrics */
     uint8_t  valid_structure;
     unsigned int bits_consumed;
+
+    /* Hardening against false-positives */
+    uint8_t  seen_known_tid;
 };
 
 static void t34_result_init(struct t34_result *r)
@@ -60,11 +63,10 @@ static void add_gssi(uint32_t gssi, struct t34_result *out)
     out->gssi_list[out->gssi_count++] = gssi;
 }
 
-/* Parses TID 5 (Group identity location accept)
- * Structure: [1 bit Mode] [2 bits Type] [Value]
- */
-static void parse_tid5(const uint8_t *bits, unsigned int bitlen, unsigned int offset,
-                       unsigned int len, struct t34_result *out)
+/* Parse TID 5 (Group identity location accept) */
+static void parse_tid5(const uint8_t *bits, unsigned int bitlen,
+                       unsigned int offset, unsigned int len,
+                       struct t34_result *out)
 {
     unsigned int p = 0;
     while (p + 3 <= len) {
@@ -95,10 +97,6 @@ static void parse_tid5(const uint8_t *bits, unsigned int bitlen, unsigned int of
     }
 }
 
-/*
- * Tries to parse a TLV chain starting at 'start_pos'.
- * Returns 1 if structure looks valid (M-bit loop allows clean exit), 0 if corrupt.
- */
 static int t34_try_parse(const uint8_t *bits, unsigned int nbits,
                          unsigned int start_pos, struct t34_result *out)
 {
@@ -106,16 +104,21 @@ static int t34_try_parse(const uint8_t *bits, unsigned int nbits,
     unsigned int pos = start_pos;
 
     if (pos + 16 > nbits) return 0;
-    if (get_bits(bits, nbits, pos, 1) != 1) return 0; /* First element MUST have M=1 */
+
+    /* Keep this requirement (matches your previous behavior) */
+    if (get_bits(bits, nbits, pos, 1) != 1) return 0; /* First M-bit must be 1 */
 
     while (pos + 16 <= nbits) {
         uint32_t m_bit = get_bits(bits, nbits, pos, 1);
         pos += 1;
 
         if (m_bit == 0) {
+            /* Hardening: require at least one known TID seen */
+            if (!out->seen_known_tid) return 0;
+
             out->valid_structure = 1;
             out->bits_consumed = pos - start_pos;
-            return 1; /* Clean exit */
+            return 1;
         }
 
         uint32_t tid = get_bits(bits, nbits, pos, 4);
@@ -123,21 +126,25 @@ static int t34_try_parse(const uint8_t *bits, unsigned int nbits,
         uint32_t li = get_bits(bits, nbits, pos, 11);
         pos += 11;
 
-        if (li > 2048 || pos + li > nbits) return 0; /* Corrupt length */
+        if (li > 2048 || pos + li > nbits) return 0;
 
         unsigned int val_start = pos;
 
         if (tid == 0x5) {
+            out->seen_known_tid = 1;
             parse_tid5(bits, nbits, val_start, li, out);
         } else if (tid == 0x6 && li >= 8) {
+            out->seen_known_tid = 1;
             out->cck = (uint8_t)get_bits(bits, nbits, val_start, 8);
             out->have_cck = 1;
         } else if (tid == 0x2) {
+            out->seen_known_tid = 1;
             unsigned int lp = 0;
             if (li > lp) { out->roam = (uint8_t)get_bits(bits, nbits, val_start + lp++, 1); out->have_roam = 1; }
             if (li > lp) { out->itsi = (uint8_t)get_bits(bits, nbits, val_start + lp++, 1); out->have_itsi = 1; }
             if (li > lp) { out->srv_rest = (uint8_t)get_bits(bits, nbits, val_start + lp++, 1); out->have_srv_rest = 1; }
         } else if (tid == 0x7 && li >= 24) {
+            out->seen_known_tid = 1;
             add_gssi(get_bits(bits, nbits, val_start, 24), out);
         } else {
             /* Unknown TID, skip */
@@ -146,7 +153,7 @@ static int t34_try_parse(const uint8_t *bits, unsigned int nbits,
         pos += li;
     }
 
-    return 0; /* Ran out of bits without M=0 */
+    return 0;
 }
 
 /* ===================== LOGGING ===================== */
@@ -177,10 +184,12 @@ static void mm_log_result(uint32_t issi, uint16_t la, const struct t34_result *r
     }
 
     if (r->gssi_count > 0) {
-        mm_logf_ctx(issi, la, "MS request for registration/authentication ACCEPTED for SSI: %u GSSI: %u%s",
+        mm_logf_ctx(issi, la,
+                    "MS request for registration/authentication ACCEPTED for SSI: %u GSSI: %u%s",
                     issi, r->gssi_list[0], tail);
     } else {
-        mm_logf_ctx(issi, la, "MS request for registration/authentication ACCEPTED for SSI: %u%s",
+        mm_logf_ctx(issi, la,
+                    "MS request for registration/authentication ACCEPTED for SSI: %u%s",
                     issi, tail);
     }
 }
@@ -194,14 +203,13 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
     (void)tms;
     if (!bits || nbits < 32) return 0;
 
-    /* Scan only early bits for MM header (cheap) */
-    unsigned int scan_limit = (nbits < 64) ? nbits : 64;
+    /* IMPORTANT: 64 bits is often too small -> increase scan window */
+    unsigned int scan_limit = (nbits < 512) ? nbits : 512;
 
     for (unsigned int off = 0; off + 16 <= scan_limit; off++) {
         uint8_t pdisc = (uint8_t)get_bits(bits, nbits, off, 3);
         if (pdisc != TMLE_PDISC_MM) continue;
 
-        /* Try offset +3 and +4 for Type (spare bit handling) */
         unsigned int type_offs[] = { off + 4, off + 3 };
 
         for (int i = 0; i < 2; i++) {
@@ -226,9 +234,8 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
                 }
             }
             else if (type == TMM_PDU_T_D_LOC_UPD_ACC) {
-                /* Brute force scan for TLV chain */
                 unsigned int scan_start = toff + 30;
-                unsigned int scan_end = (nbits > 128) ? 128 : nbits;
+                unsigned int scan_end = (nbits > 256) ? 256 : nbits;
                 if (scan_start >= scan_end) continue;
 
                 struct t34_result best_r;
@@ -239,10 +246,13 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
                     struct t34_result r;
                     if (t34_try_parse(bits, nbits, p, &r)) {
                         int score = 0;
-                        if (r.have_cck) score += 50;
-                        if (r.gssi_count > 0) score += 30;
+
+                        /* Require some “meaning”: prefer parses that actually yield fields */
+                        if (r.gssi_count > 0) score += 60;
+                        if (r.have_cck)       score += 40;
                         if (r.have_roam || r.have_itsi) score += 20;
                         if (r.have_cck && r.cck == 63) score += 10;
+
                         if (r.bits_consumed > 500) score = -1;
 
                         if (score > best_score) {
@@ -271,24 +281,8 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
             }
         }
     }
+
     return 0;
-}
-
-/* ===================== AUTO DETECT ===================== */
-
-static int looks_unpacked_bits(const uint8_t *buf, unsigned int len)
-{
-    if (!buf || len == 0) return 0;
-
-    /* Inspect first up to 64 bytes: if >75% are 0/1, treat as unpacked bits */
-    unsigned int n = (len > 64) ? 64 : len;
-    unsigned int ok = 0;
-
-    for (unsigned int i = 0; i < n; i++) {
-        if (buf[i] == 0u || buf[i] == 1u) ok++;
-    }
-
-    return (ok > (n * 3u) / 4u);
 }
 
 /* ---------- ENTRY ---------- */
@@ -300,34 +294,15 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
 
     uint32_t issi = tms ? (uint32_t)tms->ssi : 0;
 
-    /* Requested change: never pass 0xFFFF when tcs is missing */
+    /* Requested change */
     uint16_t la = (tms && tms->tcs) ? (uint16_t)tms->tcs->la : 0;
 
-    static uint8_t bits_unpacked[4096];
     static uint8_t bits_packed[4096];
 
-    if (looks_unpacked_bits(buf, len)) {
-        /* Unpacked: each byte is already a bit (0/1) */
-        unsigned int nbits_u = 0;
-        unsigned int max_u = (len > 4096) ? 4096 : len;
-        for (unsigned int i = 0; i < max_u; i++)
-            bits_unpacked[nbits_u++] = buf[i] & 1u;
+    /* Packed MSB-first bitstream (TETRA-style) */
+    unsigned int max_p_bytes = len;
+    if (max_p_bytes * 8u > 4096u) max_p_bytes = 4096u / 8u;
 
-        (void)try_decode_mm_from_bits(tms, bits_unpacked, nbits_u, issi, la);
-    } else {
-        /* Packed: bytes contain 8 bits, MSB-first */
-        unsigned int max_p_bytes = len;
-        if (max_p_bytes * 8u > 4096u) max_p_bytes = 4096u / 8u;
-
-        unsigned int nbits_p = 0;
-        for (unsigned int i = 0; i < max_p_bytes; i++) {
-            uint8_t b = buf[i];
-            for (int k = 7; k >= 0; k--)
-                bits_packed[nbits_p++] = (b >> k) & 1u;
-        }
-
-        (void)try_decode_mm_from_bits(tms, bits_packed, nbits_p, issi, la);
-    }
-
-    return (int)len;
-}
+    unsigned int nbits_p = 0;
+    for (unsigned int i = 0; i < max_p_bytes; i++) {
+        uint8_t b = buf[i];_
