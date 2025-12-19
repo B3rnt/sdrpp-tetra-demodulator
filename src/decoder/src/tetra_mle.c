@@ -59,14 +59,12 @@ static void add_gssi(uint32_t gssi, struct t34_result *out)
     out->gssi_list[out->gssi_count++] = gssi;
 }
 
-/* * Parses TID 5 (Group identity location accept)
- * Uses Standard TETRA structure: [1 bit Mode] [2 bits Type] [Value]
- */
+/* Parse TID 5 (Group identity location accept) */
 static void parse_tid5(const uint8_t *bits, unsigned int bitlen, unsigned int offset, unsigned int len, struct t34_result *out)
 {
     unsigned int p = 0;
     while (p + 3 <= len) {
-        // 1. Mode (1 bit) - Skip but consume
+        // 1. Mode (1 bit)
         p += 1; 
 
         // 2. Type (2 bits)
@@ -93,23 +91,13 @@ static void parse_tid5(const uint8_t *bits, unsigned int bitlen, unsigned int of
     }
 }
 
-/*
- * Tries to parse a TLV chain starting at 'start_pos'.
- * Returns 1 if structure looks valid (M-bit loop allows clean exit), 0 if corrupt.
- */
 static int t34_try_parse(const uint8_t *bits, unsigned int nbits, unsigned int start_pos, struct t34_result *out)
 {
     t34_result_init(out);
     unsigned int pos = start_pos;
 
-    // Sanity check: First M-bit must be 1. 
-    // (In D-Location Update Accept, the O-bit enables the chain. 
-    // If we assume start_pos is AT the first M-bit of the first element).
-    // Note: Sometimes the O-bit IS the M-bit for the first element conceptually.
-    // We scan looking for a valid header: M=1, TID=valid, LEN=valid.
-    
     if (pos + 16 > nbits) return 0;
-    if (get_bits(bits, nbits, pos, 1) != 1) return 0; // First element MUST have M=1
+    if (get_bits(bits, nbits, pos, 1) != 1) return 0; // First M-bit must be 1
 
     while (pos + 16 <= nbits) {
         uint32_t m_bit = get_bits(bits, nbits, pos, 1);
@@ -118,7 +106,7 @@ static int t34_try_parse(const uint8_t *bits, unsigned int nbits, unsigned int s
         if (m_bit == 0) {
             out->valid_structure = 1;
             out->bits_consumed = pos - start_pos;
-            return 1; // Clean exit
+            return 1;
         }
 
         uint32_t tid = get_bits(bits, nbits, pos, 4);
@@ -126,7 +114,7 @@ static int t34_try_parse(const uint8_t *bits, unsigned int nbits, unsigned int s
         uint32_t li = get_bits(bits, nbits, pos, 11);
         pos += 11;
 
-        if (li > 2048 || pos + li > nbits) return 0; // Corrupt length
+        if (li > 2048 || pos + li > nbits) return 0;
 
         unsigned int val_start = pos;
 
@@ -141,7 +129,7 @@ static int t34_try_parse(const uint8_t *bits, unsigned int nbits, unsigned int s
             if (li > lp) { out->itsi = (uint8_t)get_bits(bits, nbits, val_start+lp++, 1); out->have_itsi = 1; }
             if (li > lp) { out->srv_rest = (uint8_t)get_bits(bits, nbits, val_start+lp++, 1); out->have_srv_rest = 1; }
         } else if (tid != 0x7) {
-            // Unknown TID, but structure might be valid, continue skipping
+            // Unknown TID, skip
         } else if (tid == 0x7 && li >= 24) {
              add_gssi(get_bits(bits, nbits, val_start, 24), out);
         }
@@ -149,7 +137,7 @@ static int t34_try_parse(const uint8_t *bits, unsigned int nbits, unsigned int s
         pos += li;
     }
     
-    return 0; // Ran out of bits without M=0
+    return 0;
 }
 
 /* ===================== LOGGING ===================== */
@@ -159,10 +147,9 @@ static void mm_log_result(uint32_t issi, uint16_t la, const struct t34_result *r
     char tail[512];
     tail[0] = 0;
 
-    // Check auth state
     if (g_last_auth_ok && g_last_auth_issi == issi) {
         strncat(tail, " - Authentication successful or no authentication currently in progress", 500);
-        g_last_auth_ok = 0; // Reset
+        g_last_auth_ok = 0;
     }
 
     if (r->have_cck) {
@@ -172,12 +159,12 @@ static void mm_log_result(uint32_t issi, uint16_t la, const struct t34_result *r
     }
 
     if (r->have_itsi && r->itsi) {
-        strncat(tail, " - ITSI attach", 500 - strlen(tail));
+        strncat(tail, " - ITSI attach", 500);
     } else if (r->have_roam && r->roam) {
         if (r->have_srv_rest && r->srv_rest) 
-            strncat(tail, " - Service restoration roaming location updating", 500 - strlen(tail));
+            strncat(tail, " - Service restoration roaming location updating", 500);
         else 
-            strncat(tail, " - Roaming location updating", 500 - strlen(tail));
+            strncat(tail, " - Roaming location updating", 500);
     }
 
     if (r->gssi_count > 0) {
@@ -198,20 +185,12 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
     (void)tms;
     if (!bits || nbits < 32) return 0;
 
-    /* * Search strategy:
-     * MM header is usually at the start.
-     * PDU Type is 4 bits. We scan for Loc Upd Accept (D).
-     */
-    
-    // Limits for header scan
     unsigned int scan_limit = (nbits < 64) ? nbits : 64;
 
     for (unsigned int off = 0; off + 16 <= scan_limit; off++) {
-        // Skip PDISC check logic for a moment, check patterns
         uint8_t pdisc = (uint8_t)get_bits(bits, nbits, off, 3);
         if (pdisc != TMLE_PDISC_MM) continue;
 
-        // Try offset +3 and +4 for Type (spare bit handling)
         unsigned int type_offs[] = { off + 4, off + 3 };
         
         for (int i = 0; i < 2; i++) {
@@ -221,7 +200,6 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
             uint8_t type = (uint8_t)get_bits(bits, nbits, toff, 4);
 
             if (type == TMM_PDU_T_D_AUTH) {
-                // Auth parsing logic (simple)
                 if (toff + 6 <= nbits) {
                     uint8_t st = (uint8_t)get_bits(bits, nbits, toff + 4, 2);
                     if (st == 0) mm_logf_ctx(issi, la, "BS demands authentication: SSI: %u", issi);
@@ -234,11 +212,6 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
                 }
             }
             else if (type == TMM_PDU_T_D_LOC_UPD_ACC) {
-                // *** BRUTE FORCE SCANNER FOR TLV CHAIN ***
-                // The header has variable length. We skip the mandatory ISSI (24 bits) 
-                // and start scanning for a valid TLV chain structure.
-                // Start scanning 30 bits after Type.
-                
                 unsigned int scan_start = toff + 30;
                 unsigned int scan_end = (nbits > 128) ? 128 : nbits;
                 if (scan_start >= scan_end) continue;
@@ -250,14 +223,11 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
                 for (unsigned int p = scan_start; p < scan_end; p++) {
                     struct t34_result r;
                     if (t34_try_parse(bits, nbits, p, &r)) {
-                        // Calculate Score
                         int score = 0;
                         if (r.have_cck) score += 50;
                         if (r.gssi_count > 0) score += 30;
                         if (r.have_roam || r.have_itsi) score += 20;
-                        if (r.have_cck && r.cck == 63) score += 10; // Common value boost
-                        
-                        // Validity Check: bits consumed shouldn't exceed reasonable PDU size
+                        if (r.have_cck && r.cck == 63) score += 10;
                         if (r.bits_consumed > 500) score = -1;
 
                         if (score > best_score) {
@@ -271,13 +241,11 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
                     mm_log_result(issi, la, &best_r);
                     return 1;
                 } else {
-                    // Log basic accept if no chain found
                     struct t34_result empty; t34_result_init(&empty);
                     mm_log_result(issi, la, &empty);
                     return 1;
                 }
             }
-            // Add other types (CMD, REJ) here if needed for logs
             else if (type == TMM_PDU_T_D_LOC_UPD_CMD) {
                  mm_logf_ctx(issi, la, "SwMI sent LOCATION UPDATE COMMAND for SSI: %u", issi);
                  return 1;
@@ -302,25 +270,19 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
     int la_i = (tms && tms->tcs) ? (int)tms->tcs->la : -1;
     uint16_t la = (uint16_t)la_i;
 
-    static uint8_t bits_unpacked[4096];
     static uint8_t bits_packed[4096];
 
-    /* Unpacked */
-    unsigned int nbits_u = 0;
-    unsigned int max_u = (len > 4096) ? 4096 : len;
-    for (unsigned int i = 0; i < max_u; i++) bits_unpacked[nbits_u++] = buf[i] & 1u;
-
-    if (try_decode_mm_from_bits(tms, bits_unpacked, nbits_u, issi, la)) return (int)len;
-
-    /* Packed */
+    /* Packed MSB-first bitstream (correct for TETRA) */
     unsigned int max_p_bytes = len;
     if (max_p_bytes * 8 > 4096) max_p_bytes = 4096 / 8;
     unsigned int nbits_p = 0;
     for (unsigned int i = 0; i < max_p_bytes; i++) {
         uint8_t b = buf[i];
-        for (int k = 7; k >= 0; k--) bits_packed[nbits_p++] = (b >> k) & 1u;
+        for (int k = 7; k >= 0; k--)
+            bits_packed[nbits_p++] = (b >> k) & 1u;
     }
 
-    (void)try_decode_mm_from_bits(tms, bits_packed, nbits_p, issi, la);
+    try_decode_mm_from_bits(tms, bits_packed, nbits_p, issi, la);
+
     return (int)len;
 }
