@@ -11,15 +11,13 @@
 
 /*
  * Debug switches:
- * - MM_DUMP_RAW_BYTES: hexdump van de volledige TL-SDU bytes (buf/len)
- * - MM_DUMP_BITS:      bitdump van de volledige bits[] buffer (nbits)
- * - MM_DUMP_BITS_AS_HEX: hexdump van bits[] herverpakt naar bytes (8 bits -> 1 byte)
- *
- * Zet alles op 1 om "alles" te zien.
+ * - MM_DUMP_RAW_BYTES:       hexdump van buf/len (wat rx_tl_sdu binnenkrijgt)
+ * - MM_DUMP_BITS:            bitdump van bits[] (0/1)
+ * - MM_DUMP_BITS_AS_HEX:     hexdump van bits[] herverpakt naar bytes (8 bits -> 1 byte)
  */
-#define MM_DUMP_RAW_BYTES     1
-#define MM_DUMP_BITS          0
-#define MM_DUMP_BITS_AS_HEX   1
+#define MM_DUMP_RAW_BYTES      1
+#define MM_DUMP_BITS           0
+#define MM_DUMP_BITS_AS_HEX    1
 
 /* ===================== HEX/BIT DUMP HELPERS ===================== */
 
@@ -82,7 +80,7 @@ static void mm_log_bitdump_ctx(uint32_t issi, uint16_t la,
 
 /*
  * Herverpak bits[] (0/1 per element) naar bytes (8 bits -> 1 byte) en hexdump.
- * Dit is precies wat jij wil als je input “00 00 01 00 …” eigenlijk bits zijn.
+ * MSB-first per byte: bits[0] is bit7, bits[7] is bit0.
  */
 static void mm_log_bits_as_hex_ctx(uint32_t issi, uint16_t la,
                                    const char *prefix,
@@ -103,7 +101,7 @@ static void mm_log_bits_as_hex_ctx(uint32_t issi, uint16_t la,
         for (unsigned int j = 0; j < n; j++) {
             uint8_t v = 0;
             for (int k = 0; k < 8; k++)
-                v = (v << 1) | (bits[(i + j) * 8 + (unsigned)k] & 1u);
+                v = (uint8_t)((v << 1) | (bits[(i + j) * 8u + (unsigned)k] & 1u));
 
             snprintf(&hex[j * 3], 4, "%02X ", v);
             asc[j] = (v >= 32 && v <= 126) ? (char)v : '.';
@@ -248,14 +246,14 @@ static int t34_try_parse(const uint8_t *bits, unsigned int nbits,
             parse_tid5(bits, nbits, v, li, out);
         } else if (tid == 0x6 && li >= 8) {
             out->seen_known_tid = 1;
-            out->cck = get_bits(bits, nbits, v, 8);
+            out->cck = (uint8_t)get_bits(bits, nbits, v, 8);
             out->have_cck = 1;
         } else if (tid == 0x2) {
             out->seen_known_tid = 1;
             unsigned int lp = 0;
-            if (li > lp) { out->roam = get_bits(bits, nbits, v + lp++, 1); out->have_roam = 1; }
-            if (li > lp) { out->itsi = get_bits(bits, nbits, v + lp++, 1); out->have_itsi = 1; }
-            if (li > lp) { out->srv_rest = get_bits(bits, nbits, v + lp++, 1); out->have_srv_rest = 1; }
+            if (li > lp) { out->roam = (uint8_t)get_bits(bits, nbits, v + lp++, 1); out->have_roam = 1; }
+            if (li > lp) { out->itsi = (uint8_t)get_bits(bits, nbits, v + lp++, 1); out->have_itsi = 1; }
+            if (li > lp) { out->srv_rest = (uint8_t)get_bits(bits, nbits, v + lp++, 1); out->have_srv_rest = 1; }
         } else if (tid == 0x7 && li >= 24) {
             out->seen_known_tid = 1;
             add_gssi(get_bits(bits, nbits, v, 24), out);
@@ -322,7 +320,7 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
             unsigned int toff = type_offs[i];
             if (toff + 4 > nbits) continue;
 
-            uint8_t type = get_bits(bits, nbits, toff, 4);
+            uint8_t type = (uint8_t)get_bits(bits, nbits, toff, 4);
 
             if (type == TMM_PDU_T_D_LOC_UPD_ACC) {
                 unsigned int scan_start = toff + 30;
@@ -367,11 +365,9 @@ int rx_tl_sdu(struct tetra_mac_state *tms,
     uint16_t la   = (tms && tms->tcs) ? (uint16_t)tms->tcs->la : 0;
 
 #if MM_DUMP_RAW_BYTES
-    /* Dump altijd alles wat binnenkomt op TL-SDU niveau */
     mm_logf_ctx(issi, la, "=== RX TL-SDU len=%u ===", len);
-    mm_log_hexdump_ctx(issi, la, "TL-SDU(RAW)", buf, len);
+    mm_log_hexdump_ctx(issi, la, "TL-SDU(IN)", buf, len);
 
-    /* Snelle sanity-check: als dit alleen 00/01 is, dan is buf bit-per-byte */
     if (len >= 8) {
         mm_logf_ctx(issi, la,
             "SANITY buf[0..7]=%02X %02X %02X %02X %02X %02X %02X %02X",
@@ -379,34 +375,54 @@ int rx_tl_sdu(struct tetra_mac_state *tms,
     }
 #endif
 
+    /* =====================
+     * Build bits[] correctly:
+     * - If buf is bit-per-byte (0/1), then bits[i]=buf[i]
+     * - Else buf is byte-stream, unpack MSB->LSB
+     * ===================== */
     static uint8_t bits[4096];
     unsigned int nbits = 0;
 
-    unsigned int max = (len * 8 > 4096) ? 4096 / 8 : len;
+    /* detect bit-per-byte */
+    unsigned int probe = (len > 64) ? 64 : len;
+    int is_bit_per_byte = 1;
+    for (unsigned int i = 0; i < probe; i++) {
+        if (buf[i] > 1) { /* any value >1 => real byte stream */
+            is_bit_per_byte = 0;
+            break;
+        }
+    }
 
-    for (unsigned int i = 0; i < max; i++) {
-        uint8_t b = buf[i];
-        for (int k = 7; k >= 0; k--)
-            bits[nbits++] = (b >> k) & 1u;
+    if (is_bit_per_byte) {
+        /* Here len is effectively nbits */
+        unsigned int maxbits = (len > sizeof(bits)) ? (unsigned int)sizeof(bits) : len;
+        for (unsigned int i = 0; i < maxbits; i++)
+            bits[nbits++] = buf[i] & 1u;
+
+        mm_logf_ctx(issi, la, "INFO: input is bit-per-byte (len=%u bits)", len);
+    } else {
+        unsigned int maxbytes = (len * 8 > sizeof(bits)) ? (unsigned int)(sizeof(bits) / 8) : len;
+        for (unsigned int i = 0; i < maxbytes; i++) {
+            uint8_t b = buf[i];
+            for (int k = 7; k >= 0; k--)
+                bits[nbits++] = (b >> k) & 1u;
+        }
+
+        mm_logf_ctx(issi, la, "INFO: input is byte-stream (len=%u bytes => %u bits)", len, nbits);
     }
 
 #if MM_DUMP_BITS
-    mm_logf_ctx(issi, la, "=== RX BITSTREAM nbits=%u (from len=%u) ===", nbits, len);
+    mm_logf_ctx(issi, la, "=== RX BITSTREAM nbits=%u ===", nbits);
     mm_log_bitdump_ctx(issi, la, "BITS", bits, nbits);
 #endif
 
 #if MM_DUMP_BITS_AS_HEX
-    /*
-     * Dit is de output die jij wil:
-     * 00 AB 90 00 58 ...
-     * Als jouw buf al 00/01 per byte is, dan levert deze stap de “echte” bytes op.
-     */
     mm_logf_ctx(issi, la, "=== TL-SDU repacked from bits (nbits=%u => %u bytes) ===",
                 nbits, nbits / 8);
     mm_log_bits_as_hex_ctx(issi, la, "TL-SDU(BITS->HEX)", bits, nbits);
 #endif
 
-    /* Decode (en bestaande mm_log_result output) */
+    /* Decode */
     try_decode_mm_from_bits(tms, bits, nbits, issi, la);
 
     return (int)len;
