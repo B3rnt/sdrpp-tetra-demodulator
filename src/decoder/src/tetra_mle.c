@@ -56,7 +56,7 @@ static void add_gssi(uint32_t gssi, struct t34_result *out)
     if (gssi == 0 || out->gssi_count >= 8) return;
     for (int i = 0; i < out->gssi_count; i++)
         if (out->gssi_list[i] == gssi) return;
-    out->gssi_list[out->gssi_count++] = gssi;
+    out->gssi_list[out->gssi_count++] = gssi & 0xFFFFFFu;
 }
 
 static void parse_tid5(const uint8_t *bits, unsigned int bitlen,
@@ -102,12 +102,6 @@ static int t34_try_parse(const uint8_t *bits, unsigned int nbits,
         uint32_t m_bit = get_bits(bits, nbits, pos, 1);
         pos += 1;
 
-        if (m_bit == 0) {
-            out->valid_structure = 1;
-            out->bits_consumed = pos - start_pos;
-            return 1;
-        }
-
         uint32_t tid = get_bits(bits, nbits, pos, 4);
         pos += 4;
         uint32_t li = get_bits(bits, nbits, pos, 11);
@@ -128,10 +122,16 @@ static int t34_try_parse(const uint8_t *bits, unsigned int nbits,
             if (li > lp) { out->itsi = (uint8_t)get_bits(bits, nbits, val_start + lp++, 1); out->have_itsi = 1; }
             if (li > lp) { out->srv_rest = (uint8_t)get_bits(bits, nbits, val_start + lp++, 1); out->have_srv_rest = 1; }
         } else if (tid == 0x7 && li >= 24) {
-            add_gssi(get_bits(bits, nbits, val_start, 24), out);
+            add_gssi(get_bits(bits, nbits, val_start + (li - 24), 24), out);
         }
 
         pos += li;
+
+        if (m_bit == 0) {
+            out->valid_structure = 1;
+            out->bits_consumed = pos - start_pos;
+            return 1;
+        }
     }
 
     return 0;
@@ -141,37 +141,22 @@ static int t34_try_parse(const uint8_t *bits, unsigned int nbits,
 
 static void mm_log_result(uint32_t issi, uint16_t la, const struct t34_result *r)
 {
-    char tail[512];
-    tail[0] = 0;
+    (void)la;
 
+    const char *auth_tail = "";
     if (g_last_auth_ok && g_last_auth_issi == issi) {
-        strncat(tail, " - Authentication successful or no authentication currently in progress", 500);
+        auth_tail = " - Authentication successful or no authentication currently in progress";
         g_last_auth_ok = 0;
     }
 
-    if (r->have_cck) {
-        char tmp[64];
-        snprintf(tmp, sizeof(tmp), " - CCK_identifier: %u", r->cck);
-        strncat(tail, tmp, 500 - strlen(tail));
-    }
-
-    if (r->have_itsi && r->itsi) {
-        strncat(tail, " - ITSI attach", 500);
-    } else if (r->have_roam && r->roam) {
-        if (r->have_srv_rest && r->srv_rest)
-            strncat(tail, " - Service restoration roaming location updating", 500);
-        else
-            strncat(tail, " - Roaming location updating", 500);
-    }
-
-    if (r->gssi_count > 0) {
+    if (r && r->gssi_count > 0) {
         mm_logf_ctx(issi, la,
             "MS request for registration/authentication ACCEPTED for SSI: %u GSSI: %u%s",
-            issi, r->gssi_list[0], tail);
+            issi, r->gssi_list[0], auth_tail);
     } else {
         mm_logf_ctx(issi, la,
             "MS request for registration/authentication ACCEPTED for SSI: %u%s",
-            issi, tail);
+            issi, auth_tail);
     }
 }
 
@@ -201,12 +186,11 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
             if (type == TMM_PDU_T_D_AUTH) {
                 if (toff + 6 <= nbits) {
                     uint8_t st = (uint8_t)get_bits(bits, nbits, toff + 4, 2);
-                    if (st == 0)
+                    if (st == 0) {
                         mm_logf_ctx(issi, la, "BS demands authentication: SSI: %u", issi);
-                    else if (st == 2) {
+                    } else if (st == 2) {
                         mm_logf_ctx(issi, la,
-                            "BS result to MS authentication: Authentication successful or no authentication currently in progress SSI: %u - Authentication successful or no authentication currently in progress",
-                            issi);
+                            "BS result to MS authentication: Authentication successful or no authentication currently in progress");
                         g_last_auth_issi = issi;
                         g_last_auth_ok = 1;
                     }
@@ -214,40 +198,29 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
                 }
             }
             else if (type == TMM_PDU_T_D_LOC_UPD_ACC) {
-                unsigned int scan_start = toff + 30;
-                unsigned int scan_end = (nbits > 128) ? 128 : nbits;
+                unsigned int scan_start = toff + 12;
+                unsigned int scan_end = scan_start + 64;
+                if (scan_end > nbits) scan_end = nbits;
                 if (scan_start >= scan_end) continue;
 
-                struct t34_result best_r;
-                t34_result_init(&best_r);
-                int best_score = -1;
+                struct t34_result r;
+                int found = 0;
 
                 for (unsigned int p = scan_start; p < scan_end; p++) {
-                    struct t34_result r;
                     if (t34_try_parse(bits, nbits, p, &r)) {
-                        int score = 0;
-                        if (r.have_cck) score += 50;
-                        if (r.gssi_count > 0) score += 30;
-                        if (r.have_roam || r.have_itsi) score += 20;
-                        if (r.have_cck && r.cck == 63) score += 10;
-                        if (r.bits_consumed > 500) score = -1;
-
-                        if (score > best_score) {
-                            best_score = score;
-                            best_r = r;
-                        }
+                        found = 1;
+                        break;
                     }
                 }
 
-                if (best_score > 0) {
-                    mm_log_result(issi, la, &best_r);
-                    return 1;
+                if (found) {
+                    mm_log_result(issi, la, &r);
                 } else {
                     struct t34_result empty;
                     t34_result_init(&empty);
                     mm_log_result(issi, la, &empty);
-                    return 1;
                 }
+                return 1;
             }
             else if (type == TMM_PDU_T_D_LOC_UPD_CMD) {
                 mm_logf_ctx(issi, la, "SwMI sent LOCATION UPDATE COMMAND for SSI: %u", issi);
@@ -276,10 +249,6 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
     static uint8_t bits_packed[4096];
     unsigned int nbits_p = 0;
 
-    /* Auto-detect TL-SDU format:
-     *  - bit-per-byte (0x00/0x01): copy bits directly
-     *  - packed bytes: expand MSB-first
-     */
     int bit_per_byte = 1;
     unsigned int probe = (len < 32U) ? len : 32U;
     for (unsigned int i = 0; i < probe; i++) {
