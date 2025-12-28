@@ -1,13 +1,8 @@
 /*
- * tetra_mle.c (MM-level decoder + TL-SDU dump + GSSI fallback logging)
+ * tetra_mle.c (MM-level decoder + TL-SDU dump + TLV GSSI + FULL heuristic fallback)
  *
- * What this version does:
- *  1) Keeps the ETSI-correct path: if a valid T.34 TLV (TID 0x5 / 0x7) exists in TL-SDU, decode and print GSSI.
- *  2) Adds a practical fallback (what you asked for): if no valid TLV is found, scan the MM/TL-SDU bits for a stable
- *     24-bit candidate and print it as GSSI in the logfile line.
- *  3) Prints TL-SDU in HEX and BITS to logfile (so you can always share the exact payload being decoded).
  *
- * Drop-in replacement for your existing tetra_mle.c.
+ * Drop-in replacement for tetra_mle.c in sdrpp-tetra-demodulator.
  */
 
 #include <stdint.h>
@@ -199,8 +194,6 @@ static int t34_try_parse(const uint8_t *bits, unsigned int nbits,
 
 static void mm_log_result(uint32_t issi, uint16_t la, const struct t34_result *r)
 {
-    (void)la;
-
     if (r && r->gssi_count > 0) {
         mm_logf_ctx(issi, la,
             "MS request for registration/authentication ACCEPTED for SSI: %u GSSI: %u",
@@ -270,51 +263,38 @@ static void mm_log_tl_sdu(uint32_t issi, uint16_t la, const uint8_t *buf, unsign
 
 #if ENABLE_GSSI_HEURISTIC_FALLBACK
 /*
- * Heuristic: find a "stable" 24-bit candidate within a bounded window.
- * - We prefer a value that occurs more than once in the scan window.
- * - Otherwise we take the first non-zero candidate.
- *
- * This is intentionally pragmatic to satisfy "GSSI must appear in logfile"
- * even when no valid T.34 TLV exists at MM level.
+ * Heuristic: find a stable 24-bit candidate across FULL TL-SDU.
+ * We pick the most frequent 24-bit value (excluding zero).
  */
-static int heuristic_find_gssi_24(const uint8_t *bits, unsigned int nbits,
-                                 unsigned int scan_start, unsigned int scan_end,
-                                 uint32_t *out_gssi)
+static int heuristic_find_gssi_24_full(const uint8_t *bits, unsigned int nbits, uint32_t *out_gssi)
 {
     if (!bits || !out_gssi || nbits < 24) return 0;
-    if (scan_start >= nbits) return 0;
-    if (scan_end > nbits) scan_end = nbits;
-    if (scan_end <= scan_start + 24) return 0;
 
-    /* Track up to 16 distinct candidates in this window */
-    uint32_t cand[16];
-    uint8_t  cnt[16];
+    uint32_t cand[64];
+    uint16_t cnt[64];
     unsigned int n_cand = 0;
 
-    /* Slide bit-by-bit */
-    for (unsigned int p = scan_start; p + 24 <= scan_end; p++) {
+    for (unsigned int p = 0; p + 24 <= nbits; p++) {
         uint32_t v = get_bits(bits, nbits, p, 24) & 0xFFFFFFu;
         if (v == 0) continue;
 
-        /* Simple de-dup + count */
         unsigned int found = 0;
         for (unsigned int i = 0; i < n_cand; i++) {
             if (cand[i] == v) {
-                if (cnt[i] < 255) cnt[i]++;
+                if (cnt[i] < 65535) cnt[i]++;
                 found = 1;
                 break;
             }
         }
         if (!found && n_cand < (sizeof(cand) / sizeof(cand[0]))) {
             cand[n_cand] = v;
-            cnt[n_cand]  = 1;
+            cnt[n_cand] = 1;
             n_cand++;
         }
     }
 
     if (n_cand == 0) return 0;
 
-    /* Pick the most frequent (stable) candidate */
     unsigned int best = 0;
     for (unsigned int i = 1; i < n_cand; i++) {
         if (cnt[i] > cnt[best])
@@ -365,10 +345,6 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
                     return 1;
                 }
             } else if (type == TMM_PDU_T_D_LOC_UPD_ACC) {
-                /*
-                 * No fixed header assumptions.
-                 * Scan after MM type for a TLV, then fallback to heuristic if needed.
-                 */
                 unsigned int scan_start = toff + 4;
                 if (scan_start >= nbits)
                     continue;
@@ -389,21 +365,13 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
                 if (found_tlv) {
                     mm_log_result(issi, la, &r);
                 } else {
-                    /* No TLV: produce GSSI via heuristic (requested behavior) */
                     struct t34_result out;
                     t34_result_init(&out);
 
 #if ENABLE_GSSI_HEURISTIC_FALLBACK
-                    /*
-                     * Heuristic window: start from scan_start and extend a bit further than TLV window,
-                     * because real streams can embed the candidate slightly outside strict TLV bounds.
-                     */
-                    unsigned int h_start = scan_start;
-                    unsigned int h_end   = scan_start + 256;
-                    if (h_end > nbits) h_end = nbits;
-
+                    /* FINAL FIX: scan FULL TL-SDU, not a short window */
                     uint32_t hgssi = 0;
-                    if (heuristic_find_gssi_24(bits, nbits, h_start, h_end, &hgssi)) {
+                    if (heuristic_find_gssi_24_full(bits, nbits, &hgssi)) {
                         add_gssi(hgssi, &out);
                     }
 #endif
