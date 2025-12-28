@@ -1,3 +1,15 @@
+/*
+ * tetra_mle.c (MM-level decoder + TL-SDU dump + GSSI fallback logging)
+ *
+ * What this version does:
+ *  1) Keeps the ETSI-correct path: if a valid T.34 TLV (TID 0x5 / 0x7) exists in TL-SDU, decode and print GSSI.
+ *  2) Adds a practical fallback (what you asked for): if no valid TLV is found, scan the MM/TL-SDU bits for a stable
+ *     24-bit candidate and print it as GSSI in the logfile line.
+ *  3) Prints TL-SDU in HEX and BITS to logfile (so you can always share the exact payload being decoded).
+ *
+ * Drop-in replacement for your existing tetra_mle.c.
+ */
+
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -8,6 +20,11 @@
 #include "tetra_mm_pdu.h"
 #include "mm_sdr_rules.h"
 #include "crypto/tetra_crypto.h"
+
+/* ===================== FEATURE SWITCHES ===================== */
+
+#define ENABLE_TL_SDU_DUMP             1   /* prints TL-SDU HEX + BITS in logfile */
+#define ENABLE_GSSI_HEURISTIC_FALLBACK 1   /* prints GSSI even when no valid T.34 TLV exists */
 
 /* ---------- BIT HELPERS ---------- */
 
@@ -70,6 +87,10 @@ static void add_gssi(uint32_t gssi, struct t34_result *out)
     out->gssi_list[out->gssi_count++] = gssi;
 }
 
+/*
+ * TID 0x5 (Group identity list)
+ * Extract multiple 24-bit values where possible (real-world tolerant).
+ */
 static void parse_tid5_group_identity_list(const uint8_t *bits, unsigned int bitlen,
                                            unsigned int offset, unsigned int li,
                                            struct t34_result *out)
@@ -78,10 +99,14 @@ static void parse_tid5_group_identity_list(const uint8_t *bits, unsigned int bit
 
     unsigned int p = 0;
     while (p + 3 <= li) {
+        /* Mode (1) */
         p += 1;
+
+        /* Type (2) */
         uint8_t type = (uint8_t)get_bits(bits, bitlen, offset + p, 2);
         p += 2;
-        if (type == 3)
+
+        if (type == 3) /* end marker seen in deployments */
             break;
 
         if (type == 0) {
@@ -113,6 +138,7 @@ static int t34_try_parse(const uint8_t *bits, unsigned int nbits,
 
     unsigned int pos = start_pos;
 
+    /* Need at least one TLV header */
     if (pos + 16 > nbits) return 0;
 
     while (pos + 16 <= nbits) {
@@ -155,6 +181,7 @@ static int t34_try_parse(const uint8_t *bits, unsigned int nbits,
 
         pos += li;
 
+        /* Terminate strictly on M=0 */
         if (m_bit == 0) {
             if (out->recognized_tlvs == 0)
                 return 0;
@@ -184,6 +211,7 @@ static void mm_log_result(uint32_t issi, uint16_t la, const struct t34_result *r
             issi);
     }
 
+    /* Authentication correlation: single-use for next matching accept */
     if (g_last_auth_ok && g_last_auth_issi == issi) {
         mm_logf_ctx(issi, la,
             "- Authentication successful or no authentication currently in progress");
@@ -201,24 +229,26 @@ static void mm_log_result(uint32_t issi, uint16_t la, const struct t34_result *r
 
 /* ===================== TL-SDU LOGGING ===================== */
 
+#if ENABLE_TL_SDU_DUMP
 static void mm_log_tl_sdu(uint32_t issi, uint16_t la, const uint8_t *buf, unsigned int len)
 {
     if (!buf || len == 0) return;
 
-    // Hex format
-    char hex_line[128];
+    /* Hex dump (grouped) */
+    char hex_line[256];
     for (unsigned int i = 0; i < len; i += 16) {
         unsigned int chunk = (len - i > 16) ? 16 : (len - i);
         int pos = 0;
         pos += snprintf(hex_line + pos, sizeof(hex_line) - pos, "TL-SDU HEX: ");
         for (unsigned int j = 0; j < chunk; j++) {
             pos += snprintf(hex_line + pos, sizeof(hex_line) - pos, "%02X ", buf[i + j]);
+            if (pos >= (int)sizeof(hex_line) - 4) break;
         }
         mm_logf_ctx(issi, la, "%s", hex_line);
     }
 
-    // Bit format
-    char bit_line[128];
+    /* Bit dump (MSB-first bytes) */
+    char bit_line[256];
     for (unsigned int i = 0; i < len; i += 8) {
         unsigned int chunk = (len - i > 8) ? 8 : (len - i);
         int pos = 0;
@@ -226,12 +256,75 @@ static void mm_log_tl_sdu(uint32_t issi, uint16_t la, const uint8_t *buf, unsign
         for (unsigned int j = 0; j < chunk; j++) {
             for (int k = 7; k >= 0; k--) {
                 pos += snprintf(bit_line + pos, sizeof(bit_line) - pos, "%d", (buf[i + j] >> k) & 1);
+                if (pos >= (int)sizeof(bit_line) - 4) break;
             }
             pos += snprintf(bit_line + pos, sizeof(bit_line) - pos, " ");
+            if (pos >= (int)sizeof(bit_line) - 4) break;
         }
         mm_logf_ctx(issi, la, "%s", bit_line);
     }
 }
+#endif
+
+/* ===================== GSSI HEURISTIC FALLBACK ===================== */
+
+#if ENABLE_GSSI_HEURISTIC_FALLBACK
+/*
+ * Heuristic: find a "stable" 24-bit candidate within a bounded window.
+ * - We prefer a value that occurs more than once in the scan window.
+ * - Otherwise we take the first non-zero candidate.
+ *
+ * This is intentionally pragmatic to satisfy "GSSI must appear in logfile"
+ * even when no valid T.34 TLV exists at MM level.
+ */
+static int heuristic_find_gssi_24(const uint8_t *bits, unsigned int nbits,
+                                 unsigned int scan_start, unsigned int scan_end,
+                                 uint32_t *out_gssi)
+{
+    if (!bits || !out_gssi || nbits < 24) return 0;
+    if (scan_start >= nbits) return 0;
+    if (scan_end > nbits) scan_end = nbits;
+    if (scan_end <= scan_start + 24) return 0;
+
+    /* Track up to 16 distinct candidates in this window */
+    uint32_t cand[16];
+    uint8_t  cnt[16];
+    unsigned int n_cand = 0;
+
+    /* Slide bit-by-bit */
+    for (unsigned int p = scan_start; p + 24 <= scan_end; p++) {
+        uint32_t v = get_bits(bits, nbits, p, 24) & 0xFFFFFFu;
+        if (v == 0) continue;
+
+        /* Simple de-dup + count */
+        unsigned int found = 0;
+        for (unsigned int i = 0; i < n_cand; i++) {
+            if (cand[i] == v) {
+                if (cnt[i] < 255) cnt[i]++;
+                found = 1;
+                break;
+            }
+        }
+        if (!found && n_cand < (sizeof(cand) / sizeof(cand[0]))) {
+            cand[n_cand] = v;
+            cnt[n_cand]  = 1;
+            n_cand++;
+        }
+    }
+
+    if (n_cand == 0) return 0;
+
+    /* Pick the most frequent (stable) candidate */
+    unsigned int best = 0;
+    for (unsigned int i = 1; i < n_cand; i++) {
+        if (cnt[i] > cnt[best])
+            best = i;
+    }
+
+    *out_gssi = cand[best];
+    return 1;
+}
+#endif
 
 /* ===================== DECODER ===================== */
 
@@ -242,13 +335,16 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
     (void)tms;
     if (!bits || nbits < 32) return 0;
 
+    /* Conservative scan region for MM PDU start */
     unsigned int scan_limit = (nbits < 96) ? nbits : 96;
 
     for (unsigned int off = 0; off + 16 <= scan_limit; off++) {
         uint8_t pdisc = (uint8_t)get_bits(bits, nbits, off, 3);
         if (pdisc != TMLE_PDISC_MM) continue;
 
+        /* MM type nibble drift tolerance */
         unsigned int type_offsets[] = { 3, 4, 5, 6 };
+
         for (unsigned int ti = 0; ti < (sizeof(type_offsets) / sizeof(type_offsets[0])); ti++) {
             unsigned int toff = off + type_offsets[ti];
             if (toff + 4 > nbits) continue;
@@ -269,6 +365,10 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
                     return 1;
                 }
             } else if (type == TMM_PDU_T_D_LOC_UPD_ACC) {
+                /*
+                 * No fixed header assumptions.
+                 * Scan after MM type for a TLV, then fallback to heuristic if needed.
+                 */
                 unsigned int scan_start = toff + 4;
                 if (scan_start >= nbits)
                     continue;
@@ -277,21 +377,37 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
                 if (scan_end > nbits) scan_end = nbits;
 
                 struct t34_result r;
-                int found = 0;
+                int found_tlv = 0;
 
                 for (unsigned int p = scan_start; p + 16 <= scan_end; p++) {
                     if (t34_try_parse(bits, nbits, p, &r)) {
-                        found = 1;
+                        found_tlv = 1;
                         break;
                     }
                 }
 
-                if (found) {
+                if (found_tlv) {
                     mm_log_result(issi, la, &r);
                 } else {
-                    struct t34_result empty;
-                    t34_result_init(&empty);
-                    mm_log_result(issi, la, &empty);
+                    /* No TLV: produce GSSI via heuristic (requested behavior) */
+                    struct t34_result out;
+                    t34_result_init(&out);
+
+#if ENABLE_GSSI_HEURISTIC_FALLBACK
+                    /*
+                     * Heuristic window: start from scan_start and extend a bit further than TLV window,
+                     * because real streams can embed the candidate slightly outside strict TLV bounds.
+                     */
+                    unsigned int h_start = scan_start;
+                    unsigned int h_end   = scan_start + 256;
+                    if (h_end > nbits) h_end = nbits;
+
+                    uint32_t hgssi = 0;
+                    if (heuristic_find_gssi_24(bits, nbits, h_start, h_end, &hgssi)) {
+                        add_gssi(hgssi, &out);
+                    }
+#endif
+                    mm_log_result(issi, la, &out);
                 }
                 return 1;
             } else if (type == TMM_PDU_T_D_LOC_UPD_CMD) {
@@ -318,9 +434,14 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
     int la_i = (tms && tms->tcs) ? (int)tms->tcs->la : -1;
     uint16_t la = (uint16_t)la_i;
 
+#if ENABLE_TL_SDU_DUMP
+    mm_log_tl_sdu(issi, la, buf, len);
+#endif
+
     static uint8_t bits_packed[4096];
     unsigned int nbits_p = 0;
 
+    /* Auto-detect bit-per-byte (0x00/0x01) vs packed MSB-first */
     int bit_per_byte = 1;
     unsigned int probe = (len < 32U) ? len : 32U;
     for (unsigned int i = 0; i < probe; i++) {
@@ -348,9 +469,6 @@ int rx_tl_sdu(struct tetra_mac_state *tms, struct msgb *msg, unsigned int len)
                 bits_packed[nbits_p++] = (uint8_t)((b >> k) & 1u);
         }
     }
-
-    // ==== NEW: TL-SDU LOGGING ====
-    mm_log_tl_sdu(issi, la, buf, len);
 
     try_decode_mm_from_bits(tms, bits_packed, nbits_p, issi, la);
 
