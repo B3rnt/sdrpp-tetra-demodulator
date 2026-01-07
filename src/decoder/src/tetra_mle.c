@@ -308,12 +308,81 @@ static int heuristic_find_gssi_24_full(const uint8_t *bits, unsigned int nbits, 
 
 /* ===================== DECODER ===================== */
 
+static const char *plugin5_mm_type_name(uint8_t type)
+{
+    switch (type) {
+    case TMM_PDU_T_D_OTAR:            return "D_OTAR";
+    case TMM_PDU_T_D_AUTH:            return "D_AUTHENTICATION";
+    case TMM_PDU_T_D_CK_CHG_DEM:      return "D_CK_CHANGE_DEMAND";
+    case TMM_PDU_T_D_DISABLE:         return "D_DISABLE";
+    case TMM_PDU_T_D_ENABLE:          return "D_ENABLE";
+    case TMM_PDU_T_D_LOC_UPD_ACC:     return "D_LOCATION_UPDATE_ACCEPT";
+    case TMM_PDU_T_D_LOC_UPD_CMD:     return "D_LOCATION_UPDATE_COMMAND";
+    case TMM_PDU_T_D_LOC_UPD_REJ:     return "D_LOCATION_UPDATE_REJECT";
+    case TMM_PDU_T_D_LOC_UPD_PROC:    return "D_LOCATION_UPDATE_PROCEEDING";
+    case TMM_PDU_T_D_ATT_DET_GRP:     return "D_ATTACH_DETACH_GROUP_IDENTITY";
+    case TMM_PDU_T_D_ATT_DET_GRP_ACK: return "D_ATTACH_DETACH_GROUP_IDENTITY_ACKNOWLEDGEMENT";
+    case TMM_PDU_T_D_MM_STATUS:       return "D_MM_STATUS";
+    case TMM_PDU_T_D_MM_PDU_NOTSUPP:  return "MM_PDU_FUNCTION_NOT_SUPPORTED";
+    default:                          return NULL;
+    }
+}
+
+static uint8_t read_byte_at_bit(const uint8_t *bits, unsigned int nbits, unsigned int bit_offset)
+{
+    uint8_t v = 0;
+    for (unsigned int i = 0; i < 8; i++) {
+        unsigned int b = bit_offset + i;
+        uint8_t bit = (b < nbits) ? (bits[b] & 1u) : 0u;
+        v |= (uint8_t)(bit << (7 - i));
+    }
+    return v;
+}
+
+static void bits_to_hex(const uint8_t *bits, unsigned int nbits,
+                        unsigned int bit_offset, unsigned int bit_length,
+                        char *out, size_t out_sz)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    if (!out || out_sz == 0) return;
+    out[0] = 0;
+
+    size_t w = 0;
+    for (unsigned int i = 0; i < bit_length; i += 8) {
+        uint8_t v = 0;
+        for (unsigned int j = 0; j < 8; j++) {
+            unsigned int b = bit_offset + i + j;
+            uint8_t bit = (b < nbits && (i + j) < bit_length) ? (bits[b] & 1u) : 0u;
+            v |= (uint8_t)(bit << (7 - j));
+        }
+        if (w + 2 >= out_sz) break;
+        out[w++] = hex[(v >> 4) & 0xF];
+        out[w++] = hex[v & 0xF];
+        out[w] = 0;
+    }
+}
+
+static int g_last_auth_status = -1;
+static int g_last_auth_ssi = -1;
+static time_t g_last_auth_time = 0;
+
+static const char *plugin5_auth_status_to_string(int status)
+{
+    /* Plugin5 implementation */
+    if (status >= 0)
+        return "Authentication successful or no authentication currently in progress";
+    return "Authentication status unknown";
+}
+
 static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
                                    const uint8_t *bits, unsigned int nbits,
                                    uint32_t issi, uint16_t la)
 {
-    (void)tms;
-    if (!bits || nbits < 32) return 0;
+    if (!bits || nbits < 16) return 0;
+
+    /* If caller didn't pass LA, try pull from state (like Plugin5 uses runtime) */
+    if ((int)la <= 0 && tms && tms->tcs)
+        la = (uint16_t)tms->tcs->la;
 
     /* Conservative scan region for MM PDU start */
     unsigned int scan_limit = (nbits < 96) ? nbits : 96;
@@ -330,61 +399,229 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
             if (toff + 4 > nbits) continue;
 
             uint8_t type = (uint8_t)get_bits(bits, nbits, toff, 4);
+            const char *tname = plugin5_mm_type_name(type);
+
+            unsigned int pdu_start = off;
+            unsigned int body = toff + 4;
+            unsigned int pdu_len = (nbits > pdu_start) ? (nbits - pdu_start) : 0;
+
+            /* Plugin5 aligns within first byte to detect ITSI / roaming markers (0x57 / 0x51) */
+            int align = 0;
+            for (int a = 0; a < 8; a++) {
+                if (pdu_start + (unsigned int)a + 8 > nbits) break;
+                uint8_t b = read_byte_at_bit(bits, nbits, pdu_start + (unsigned int)a);
+                if (b == 0x57 || b == 0x51) { align = a; break; }
+            }
+            uint8_t luFirst = read_byte_at_bit(bits, nbits, pdu_start + (unsigned int)align);
+            int isItsi = (luFirst == 0x57);
+            int isRoam = (luFirst == 0x51);
+
+            /* RAW logging types in Plugin5 */
+            int want_raw = (type == TMM_PDU_T_D_MM_STATUS) ||
+                           (type == TMM_PDU_T_D_LOC_UPD_CMD) ||
+                           (type == TMM_PDU_T_D_ENABLE);
+
+            char rawhex[1100];
+            rawhex[0] = 0;
+            if (want_raw && pdu_len > 0)
+                bits_to_hex(bits, nbits, pdu_start, pdu_len, rawhex, sizeof(rawhex));
 
             if (type == TMM_PDU_T_D_AUTH) {
-                if (toff + 6 <= nbits) {
-                    uint8_t st = (uint8_t)get_bits(bits, nbits, toff + 4, 2);
-                    if (st == 0) {
-                        mm_logf_ctx(issi, la, "BS demands authentication: SSI: %u", issi);
-                    } else if (st == 2) {
-                        mm_logf_ctx(issi, la,
-                            "BS result to MS authentication: Authentication successful or no authentication currently in progress");
-                        g_last_auth_issi = issi;
-                        g_last_auth_ok = 1;
-                    }
+                /* sub-type: 2 bits */
+                if (body + 2 > nbits) return 1;
+                int sub = (int)get_bits(bits, nbits, body, 2);
+                body += 2;
+
+                if (sub == 0) { /* Demand */
+                    /* Plugin5: "BS demands authentication" + optional SSI */
+                    if (issi > 0)
+                        mm_logf_ctx(issi, la, "BS demands authentication: SSI: %u", (unsigned)issi);
+                    else
+                        mm_logf_ctx(issi, la, "BS demands authentication");
                     return 1;
                 }
-            } else if (type == TMM_PDU_T_D_LOC_UPD_ACC) {
-                unsigned int scan_start = toff + 4;
-                if (scan_start >= nbits)
-                    continue;
 
-                unsigned int scan_end = scan_start + 64;
-                if (scan_end > nbits) scan_end = nbits;
+                if ((sub == 2 || sub == 3) && (body + 6 <= nbits)) { /* Result or Reject */
+                    int status = (int)get_bits(bits, nbits, body, 6);
+                    g_last_auth_status = status;
+                    g_last_auth_ssi = (issi > 0) ? (int)issi : -1;
+                    g_last_auth_time = time(NULL);
 
-                struct t34_result r;
-                int found_tlv = 0;
-
-                for (unsigned int p = scan_start; p + 16 <= scan_end; p++) {
-                    if (t34_try_parse(bits, nbits, p, &r)) {
-                        found_tlv = 1;
-                        break;
-                    }
+                    const char *st = plugin5_auth_status_to_string(status);
+                    if (issi > 0)
+                        mm_logf_ctx(issi, la, "BS result to MS authentication: %s SSI: %u - %s",
+                                    st, (unsigned)issi, st);
+                    else
+                        mm_logf_ctx(issi, la, "BS result to MS authentication: %s - %s", st, st);
+                    return 1;
                 }
 
-                if (found_tlv) {
-                    mm_log_result(issi, la, &r);
-                } else {
-                    struct t34_result out;
-                    t34_result_init(&out);
-
-#if ENABLE_GSSI_HEURISTIC_FALLBACK
-                    /* FINAL FIX: scan FULL TL-SDU, not a short window */
-                    uint32_t hgssi = 0;
-                    if (heuristic_find_gssi_24_full(bits, nbits, &hgssi)) {
-                        add_gssi(hgssi, &out);
-                    }
-#endif
-                    mm_log_result(issi, la, &out);
-                }
-                return 1;
-            } else if (type == TMM_PDU_T_D_LOC_UPD_CMD) {
-                mm_logf_ctx(issi, la, "SwMI sent LOCATION UPDATE COMMAND for SSI: %u", issi);
-                return 1;
-            } else if (type == TMM_PDU_T_D_LOC_UPD_REJ) {
-                mm_logf_ctx(issi, la, "SwMI sent LOCATION UPDATE REJECT for SSI: %u", issi);
+                /* Fallback */
+                if (issi > 0)
+                    mm_logf_ctx(issi, la, "MM D_AUTHENTICATION auth_sub=%d SSI: %u", sub, (unsigned)issi);
+                else
+                    mm_logf_ctx(issi, la, "MM D_AUTHENTICATION auth_sub=%d", sub);
                 return 1;
             }
+
+            if (type == TMM_PDU_T_D_MM_STATUS) {
+                if (body + 6 <= nbits) {
+                    int st = (int)get_bits(bits, nbits, body, 6);
+                    /* Plugin5 reads MM_SSI after status, but logging uses SSI variable; use issi as SSI. */
+                    if (issi > 0)
+                        mm_logf_ctx(issi, la, "MM D_MM_STATUS status=%d SSI: %u%s%s",
+                                    st, (unsigned)issi,
+                                    want_raw ? "  raw=" : "",
+                                    want_raw ? rawhex : "");
+                    else
+                        mm_logf_ctx(issi, la, "MM D_MM_STATUS status=%d%s%s",
+                                    st,
+                                    want_raw ? "  raw=" : "",
+                                    want_raw ? rawhex : "");
+                } else {
+                    mm_logf_ctx(issi, la, "MM D_MM_STATUS%s%s",
+                                want_raw ? "  raw=" : "",
+                                want_raw ? rawhex : "");
+                }
+                return 1;
+            }
+
+            if (type == TMM_PDU_T_D_ENABLE) {
+                if (issi > 0)
+                    mm_logf_ctx(issi, la, "MM D_ENABLE SSI: %u%s%s",
+                                (unsigned)issi,
+                                want_raw ? "  raw=" : "",
+                                want_raw ? rawhex : "");
+                else
+                    mm_logf_ctx(issi, la, "MM D_ENABLE%s%s",
+                                want_raw ? "  raw=" : "",
+                                want_raw ? rawhex : "");
+                return 1;
+            }
+
+            if (type == TMM_PDU_T_D_LOC_UPD_CMD) {
+                if (issi > 0)
+                    mm_logf_ctx(issi, la, "MM D_LOCATION_UPDATE_COMMAND SSI: %u%s%s",
+                                (unsigned)issi,
+                                want_raw ? "  raw=" : "",
+                                want_raw ? rawhex : "");
+                else
+                    mm_logf_ctx(issi, la, "MM D_LOCATION_UPDATE_COMMAND%s%s",
+                                want_raw ? "  raw=" : "",
+                                want_raw ? rawhex : "");
+                return 1;
+            }
+
+            if (type == TMM_PDU_T_D_LOC_UPD_PROC) {
+                if (issi > 0)
+                    mm_logf_ctx(issi, la, "MM D_LOCATION_UPDATE_PROCEEDING SSI: %u", (unsigned)issi);
+                else
+                    mm_logf_ctx(issi, la, "MM D_LOCATION_UPDATE_PROCEEDING");
+                return 1;
+            }
+
+            if (type == TMM_PDU_T_D_LOC_UPD_REJ) {
+                if (issi > 0)
+                    mm_logf_ctx(issi, la, "MM D_LOCATION_UPDATE_REJECT SSI: %u", (unsigned)issi);
+                else
+                    mm_logf_ctx(issi, la, "MM D_LOCATION_UPDATE_REJECT");
+                return 1;
+            }
+
+            if (type == TMM_PDU_T_D_LOC_UPD_ACC) {
+                /* Decode accept_type if present via SDR rules */
+                mm_field_store fs;
+                memset(&fs, 0, sizeof(fs));
+                mm_rules_decode(bits, nbits, body, mm_rules_loc_upd_accept, mm_rules_loc_upd_accept_count, &fs);
+
+                int acc = -1;
+                if (fs.present[GN_Location_update_accept_type])
+                    acc = (int)fs.value[GN_Location_update_accept_type];
+
+                /* Parse TLVs to recover GSSI/CCK (Plugin5 logic) */
+                struct t34_result r;
+                t34_result_init(&r);
+
+                unsigned int scan_start = body;
+                unsigned int scan_end = (nbits < body + 512) ? nbits : (body + 512);
+
+                for (unsigned int p = scan_start; p + 16 <= scan_end; p++) {
+                    if (t34_try_parse(bits, nbits, p, &r)) break;
+                }
+
+                int gssi = (r.gssi_count > 0) ? (int)r.gssi[0] : 0;
+                int gssiVerified = (r.gssi_count > 0) ? 1 : 0;
+                int cckId = (r.have_cck) ? (int)r.cck : 0;
+
+                /* Build EXACT Plugin5 text */
+                char line[1100];
+                size_t w = 0;
+
+                w += (size_t)snprintf(line + w, sizeof(line) - w, "MS request for registration");
+
+                double dt = difftime(time(NULL), g_last_auth_time);
+                int recentAuth = (g_last_auth_ssi > 0 && (issi > 0) && (g_last_auth_ssi == (int)issi) && dt <= 3.0);
+
+                if (acc == 0 || recentAuth) {
+                    w += (size_t)snprintf(line + w, sizeof(line) - w, "/authentication ACCEPTED");
+                } else {
+                    w += (size_t)snprintf(line + w, sizeof(line) - w, " ACCEPTED");
+                }
+
+                if (issi > 0) {
+                    w += (size_t)snprintf(line + w, sizeof(line) - w, " for SSI: %u", (unsigned)issi);
+                }
+
+                if (acc == 0) {
+                    if (gssi > 0) {
+                        w += (size_t)snprintf(line + w, sizeof(line) - w, " GSSI: %d", gssi);
+                    }
+                } else {
+                    if (gssiVerified > 0 && gssi > 0) {
+                        w += (size_t)snprintf(line + w, sizeof(line) - w, " GSSI: %d", gssi);
+                    }
+                }
+
+                if (g_last_auth_status >= 0 && (g_last_auth_ssi <= 0 || (issi > 0 && g_last_auth_ssi == (int)issi))) {
+                    w += (size_t)snprintf(line + w, sizeof(line) - w, " - %s", plugin5_auth_status_to_string(g_last_auth_status));
+                    g_last_auth_status = -1;
+                    g_last_auth_ssi = -1;
+                }
+
+                if (cckId > 0) {
+                    w += (size_t)snprintf(line + w, sizeof(line) - w, " - CCK_identifier: %d", cckId);
+                }
+
+                if (isItsi) {
+                    w += (size_t)snprintf(line + w, sizeof(line) - w, " - ITSI attach");
+                } else if (isRoam) {
+                    w += (size_t)snprintf(line + w, sizeof(line) - w, " - Roaming location updating");
+                }
+
+                mm_logf_ctx(issi, la, "%s", line);
+                return 1;
+            }
+
+            /* OTAR has its own string in Plugin5 */
+            if (type == TMM_PDU_T_D_OTAR) {
+                mm_logf_ctx(issi, la, "MM D_OTAR");
+                return 1;
+            }
+
+            /* Default formatting like Plugin5:
+               "MM <enumName> SSI: <ssi>" when name known; otherwise numeric. */
+            if (tname) {
+                if (issi > 0)
+                    mm_logf_ctx(issi, la, "MM %s SSI: %u", tname, (unsigned)issi);
+                else
+                    mm_logf_ctx(issi, la, "MM %s", tname);
+            } else {
+                if (issi > 0)
+                    mm_logf_ctx(issi, la, "MM %u SSI: %u", (unsigned)type, (unsigned)issi);
+                else
+                    mm_logf_ctx(issi, la, "MM %u", (unsigned)type);
+            }
+            return 1;
         }
     }
 
