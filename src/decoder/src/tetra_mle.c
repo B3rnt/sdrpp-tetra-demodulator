@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "tetra_mle_pdu.h"
 #include "tetra_mle.h"
@@ -549,7 +550,7 @@ static int try_decode_mm_from_bits(struct tetra_mac_state *tms,
                     if (t34_try_parse(bits, nbits, p, &r)) break;
                 }
 
-                int gssi = (r.gssi_count > 0) ? (int)r.gssi[0] : 0;
+                int gssi = (r.gssi_count > 0) ? (int)r.gssi_list[0] : 0;
                 int gssiVerified = (r.gssi_count > 0) ? 1 : 0;
                 int cckId = (r.have_cck) ? (int)r.cck : 0;
 
