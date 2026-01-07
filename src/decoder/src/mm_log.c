@@ -71,3 +71,22 @@ void mm_logf_ctx(uint32_t issi, int la, const char *fmt, ...)
 
     mm_log_ctx(issi, la, msg);
 }
+
+/* Backwards-compatible API used by older decoder code paths */
+void mm_log(const char *line)
+{
+    mm_log_ctx(0, 0, line);
+}
+
+void mm_logf(const char *fmt, ...)
+{
+    if (!fmt || !*fmt) return;
+
+    char msg[1100];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    mm_log_ctx(0, 0, msg);
+}

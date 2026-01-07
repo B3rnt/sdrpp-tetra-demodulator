@@ -9,6 +9,11 @@ extern "C" {
 /* Plugin5-compatible MM message log.
    Writes to "mm_messages.log" in the SDR++ working directory. */
 
+/* Backwards-compatible API (used by some decoder code). These call the ctx
+   versions with unknown ISSI/LA. */
+void mm_log(const char *line);
+void mm_logf(const char *fmt, ...);
+
 /* Write one MM log line (body text). Prefix (time + LA) is added automatically. */
 void mm_log_ctx(uint32_t issi, int la, const char *line);
 
